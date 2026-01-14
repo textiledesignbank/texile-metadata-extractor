@@ -18,6 +18,7 @@ import time
 import sqlite3
 from datetime import datetime
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 환경변수 로드
 load_dotenv()
@@ -736,11 +737,11 @@ def main():
                 st.rerun()
 
         else:
-            # 모델 비교 테스트
+            # 모델 비교 테스트 (병렬 처리)
             if not selected_models:
                 st.warning("비교할 모델을 선택해주세요.")
             else:
-                if st.button("🔬 모델 비교 테스트", type="primary", use_container_width=True):
+                if st.button("🔬 모델 비교 테스트 (병렬)", type="primary", use_container_width=True):
                     for file in uploaded_files:
                         image = Image.open(file)
                         image = preprocess_image(image)
@@ -752,27 +753,39 @@ def main():
                         with img_col:
                             st.image(image, caption=file.name, width=150)
 
+                        # 병렬 API 호출
+                        with st.spinner(f"🚀 {len(selected_models)}개 모델 병렬 분석 중..."):
+                            results_map = {}
+
+                            def analyze_model(model_id):
+                                return model_id, analyze_image(image, model_id, resolution)
+
+                            with ThreadPoolExecutor(max_workers=len(selected_models)) as executor:
+                                futures = {executor.submit(analyze_model, m): m for m in selected_models}
+                                for future in as_completed(futures):
+                                    model_id, result = future.result()
+                                    results_map[model_id] = result
+
+                        # 결과 표시 (선택한 순서대로)
                         cols = st.columns(len(selected_models))
                         comparison = {"filename": file.name, "image": image, "results": {}}
 
                         for idx, model_id in enumerate(selected_models):
+                            result = results_map[model_id]
+                            comparison["results"][model_id] = result
+
+                            # DB에 저장
+                            save_result_to_db({
+                                "filename": file.name,
+                                "model": model_id,
+                                "resolution": resolution,
+                                "result": result,
+                                "image": image
+                            })
+
                             with cols[idx]:
                                 model_name = MODEL_OPTIONS[model_id]["name"].split(". ")[1]
                                 st.caption(f"**{model_name}**")
-
-                                with st.spinner("분석 중..."):
-                                    result = analyze_image(image, model_id, resolution)
-
-                                comparison["results"][model_id] = result
-
-                                # DB에 저장
-                                save_result_to_db({
-                                    "filename": file.name,
-                                    "model": model_id,
-                                    "resolution": resolution,
-                                    "result": result,
-                                    "image": image
-                                })
 
                                 if result["success"]:
                                     st.success(f"✅ {result['elapsed_time']:.2f}s | ₩{result['cost']['krw']:.2f}")
@@ -922,12 +935,76 @@ def main():
     st.divider()
     st.subheader("💾 저장된 분석 결과 (DB)")
 
-    # 페이지네이션 설정
-    items_per_page = st.selectbox("페이지당 항목 수", [10, 20, 50], index=0)
-
     # 총 개수 조회
     db_stats = get_db_stats()
     total_count = db_stats["total_count"]
+
+    # CSV 내보내기 버튼
+    col_export1, col_export2 = st.columns([1, 3])
+    with col_export1:
+        if st.button("📥 전체 CSV 내보내기", use_container_width=True, disabled=total_count == 0):
+            # 전체 데이터 조회
+            all_results = load_results_from_db(limit=10000, offset=0)
+
+            if all_results:
+                import pandas as pd
+
+                csv_rows = []
+                for r in all_results:
+                    row = {
+                        "ID": r["id"],
+                        "파일명": r["filename"],
+                        "모델": r["model"],
+                        "해상도": r["resolution"],
+                        "성공": "Y" if r["success"] else "N",
+                        "비용_USD": r["cost_usd"],
+                        "비용_KRW": r["cost_krw"],
+                        "소요시간": r["elapsed_time"],
+                        "일시": r["created_at"],
+                    }
+
+                    # 메타데이터 필드 추가
+                    if r["success"] and r["metadata"]:
+                        m = r["metadata"]
+                        row["카테고리"] = m.get("category", {}).get("primary", "")
+                        row["카테고리_부가"] = ", ".join(m.get("category", {}).get("secondary", []))
+                        row["스타일"] = m.get("style", {}).get("type", "")
+                        row["스타일_시대"] = m.get("style", {}).get("era", "")
+                        row["스타일_기법"] = m.get("style", {}).get("technique", "")
+                        row["무드"] = m.get("mood", {}).get("primary", "")
+                        row["무드_부가"] = ", ".join(m.get("mood", {}).get("secondary", []))
+                        row["색상"] = ", ".join(m.get("colors", {}).get("dominant", []))
+                        row["팔레트"] = m.get("colors", {}).get("palette_name", "")
+                        row["색상무드"] = m.get("colors", {}).get("mood", "")
+                        row["패턴_크기"] = m.get("pattern", {}).get("scale", "")
+                        row["패턴_반복"] = m.get("pattern", {}).get("repeat_type", "")
+                        row["패턴_밀도"] = m.get("pattern", {}).get("density", "")
+                        row["키워드"] = ", ".join(m.get("keywords", {}).get("search_tags", []))
+                        row["설명"] = m.get("keywords", {}).get("description", "")
+                        row["추천제품"] = ", ".join(m.get("usage_suggestion", {}).get("products", []))
+                        row["추천시즌"] = ", ".join(m.get("usage_suggestion", {}).get("season", []))
+                        row["타겟마켓"] = ", ".join(m.get("usage_suggestion", {}).get("target_market", []))
+
+                    csv_rows.append(row)
+
+                df = pd.DataFrame(csv_rows)
+                csv_data = df.to_csv(index=False, encoding="utf-8-sig")
+
+                st.download_button(
+                    label=f"📄 다운로드 ({total_count}건)",
+                    data=csv_data,
+                    file_name=f"textile_analysis_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+
+    with col_export2:
+        st.caption(f"총 {total_count}건의 분석 결과가 저장되어 있습니다.")
+
+    st.divider()
+
+    # 페이지네이션 설정
+    items_per_page = st.selectbox("페이지당 항목 수", [10, 20, 50], index=0)
 
     if total_count > 0:
         total_pages = (total_count + items_per_page - 1) // items_per_page
