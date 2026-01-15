@@ -1433,14 +1433,15 @@ def main():
                     else:
                         st.error(f"분석 실패: {item['result'].get('error', 'Unknown error')}")
 
-        # CSV 다운로드
+        # Excel 다운로드
         st.divider()
 
         col1, col2 = st.columns(2)
 
         with col1:
-            if st.button("📥 결과 CSV 다운로드", use_container_width=True):
+            if st.button("📥 결과 Excel 다운로드", use_container_width=True):
                 import pandas as pd
+                import io
 
                 rows = []
                 for item in st.session_state.results:
@@ -1465,12 +1466,15 @@ def main():
 
                 if rows:
                     df = pd.DataFrame(rows)
-                    csv = df.to_csv(index=False, encoding="utf-8-sig")
+                    excel_buffer = io.BytesIO()
+                    with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                        df.to_excel(writer, sheet_name='분석결과', index=False)
+                    excel_buffer.seek(0)
                     st.download_button(
                         "다운로드",
-                        csv,
-                        f"metadata_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                        "text/csv"
+                        excel_buffer,
+                        f"metadata_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     )
 
         with col2:
@@ -1613,11 +1617,11 @@ def main():
 
                     st.divider()
 
-                    # CSV 내보내기
-                    csv_full_stats = []
+                    # Excel 내보내기
+                    excel_full_stats = []
                     for s in model_stats:
                         model_name = MODEL_OPTIONS.get(s["model"], {}).get("name", s["model"])
-                        csv_full_stats.append({
+                        excel_full_stats.append({
                             "모델ID": s["model"],
                             "모델명": model_name,
                             "해상도": s["resolution"],
@@ -1639,12 +1643,16 @@ def main():
                             "100000개예상_KRW": s["cost_per_100000"],
                         })
 
-                    df_csv = pd.DataFrame(csv_full_stats)
+                    df_stats = pd.DataFrame(excel_full_stats)
+                    excel_buffer = io.BytesIO()
+                    with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                        df_stats.to_excel(writer, sheet_name='수치형통계', index=False)
+                    excel_buffer.seek(0)
                     st.download_button(
-                        label="📥 수치형 통계 CSV 다운로드",
-                        data=df_csv.to_csv(index=False, encoding="utf-8-sig"),
-                        file_name=f"model_stats_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                        mime="text/csv",
+                        label="📥 수치형 통계 Excel 다운로드",
+                        data=excel_buffer,
+                        file_name=f"model_stats_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True
                     )
 
@@ -1667,11 +1675,11 @@ def main():
                             })
                         st.dataframe(pd.DataFrame(conf_data), use_container_width=True, hide_index=True)
 
-                        # CSV 내보내기
-                        csv_conf = []
+                        # Excel 내보내기
+                        excel_conf = []
                         for s in confidence_stats:
                             model_name = MODEL_OPTIONS.get(s["model"], {}).get("name", s["model"])
-                            csv_conf.append({
+                            excel_conf.append({
                                 "모델ID": s["model"],
                                 "모델명": model_name,
                                 "해상도": s["resolution"],
@@ -1681,12 +1689,16 @@ def main():
                                 "최대신뢰도": s["max_confidence"],
                                 "표준편차": s["stddev_confidence"],
                             })
-                        df_conf_csv = pd.DataFrame(csv_conf)
+                        df_conf = pd.DataFrame(excel_conf)
+                        excel_buffer = io.BytesIO()
+                        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                            df_conf.to_excel(writer, sheet_name='신뢰도통계', index=False)
+                        excel_buffer.seek(0)
                         st.download_button(
-                            label="📥 신뢰도 통계 CSV 다운로드",
-                            data=df_conf_csv.to_csv(index=False, encoding="utf-8-sig"),
-                            file_name=f"confidence_stats_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                            mime="text/csv",
+                            label="📥 신뢰도 통계 Excel 다운로드",
+                            data=excel_buffer,
+                            file_name=f"confidence_stats_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             use_container_width=True
                         )
                     else:
@@ -1799,17 +1811,18 @@ def main():
             if selected_model_filter != "전체" or selected_resolution_filter != "전체" or selected_success_filter != "전체":
                 st.info(f"🔍 필터 적용됨: {filtered_count}건 / 전체 {total_count}건")
 
-            # CSV 내보내기 버튼
+            # Excel 내보내기 버튼
             col_export1, col_export2 = st.columns([1, 3])
             with col_export1:
-                if st.button("📥 전체 CSV 내보내기", use_container_width=True, disabled=total_count == 0):
+                if st.button("📥 전체 Excel 내보내기", use_container_width=True, disabled=total_count == 0):
                     # 전체 데이터 조회
                     all_results = load_results_from_db(limit=10000, offset=0)
 
                     if all_results:
                         import pandas as pd
+                        import io
 
-                        csv_rows = []
+                        excel_rows = []
                         for r in all_results:
                             row = {
                                 "ID": r["id"],
@@ -1846,16 +1859,19 @@ def main():
                                 row["추천시즌"] = ", ".join(m.get("usage_suggestion", {}).get("season", []))
                                 row["타겟마켓"] = ", ".join(m.get("usage_suggestion", {}).get("target_market", []))
 
-                            csv_rows.append(row)
+                            excel_rows.append(row)
 
-                        df = pd.DataFrame(csv_rows)
-                        csv_data = df.to_csv(index=False, encoding="utf-8-sig")
+                        df = pd.DataFrame(excel_rows)
+                        excel_buffer = io.BytesIO()
+                        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                            df.to_excel(writer, sheet_name='전체분석결과', index=False)
+                        excel_buffer.seek(0)
 
                         st.download_button(
                             label=f"📄 다운로드 ({total_count}건)",
-                            data=csv_data,
-                            file_name=f"textile_analysis_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                            mime="text/csv",
+                            data=excel_buffer,
+                            file_name=f"textile_analysis_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             use_container_width=True
                         )
 
