@@ -844,6 +844,9 @@ def show_detail_dialog(result: dict):
     with st.expander("📄 전체 JSON 데이터"):
         st.json(metadata)
 
+    # 다이얼로그가 열려있음을 표시 (닫힐 때 감지용)
+    st.session_state.dialog_was_open = True
+
 
 def main():
     st.set_page_config(
@@ -1201,6 +1204,7 @@ def main():
                             "model": item["model"],
                             "resolution": item["resolution"],
                             "category": ", ".join(cat_matches) if cat_matches else m.get("category", {}).get("primary", ""),
+                            "confidence": m.get("category", {}).get("confidence", ""),
                             "style": m.get("style", {}).get("type", ""),
                             "mood": m.get("mood", {}).get("primary", ""),
                             "colors": ", ".join(m.get("colors", {}).get("dominant", [])),
@@ -1327,6 +1331,7 @@ def main():
                         m = r["metadata"]
                         cat_matches = m.get("category", {}).get("matches", [])
                         row["카테고리"] = ", ".join(cat_matches) if cat_matches else m.get("category", {}).get("primary", "")
+                        row["신뢰도"] = m.get("category", {}).get("confidence", "")
                         row["스타일"] = m.get("style", {}).get("type", "")
                         row["스타일_시대"] = m.get("style", {}).get("era", "")
                         row["스타일_기법"] = m.get("style", {}).get("technique", "")
@@ -1412,35 +1417,55 @@ def main():
         if db_results:
             import pandas as pd
 
-            st.caption("📌 테이블에서 행을 선택하면 상세 정보를 볼 수 있습니다.")
+            st.caption("📌 체크박스를 선택하면 상세 정보를 볼 수 있습니다.")
 
             # 테이블 데이터 구성
             df_data = []
             for r in db_results:
+                # 메타데이터에서 카테고리, 신뢰도 추출
+                meta = r.get("metadata", {}) or {}
+                cat_matches = meta.get("category", {}).get("matches", [])
+                category_str = ", ".join(cat_matches) if cat_matches else meta.get("category", {}).get("primary", "-")
+                confidence = meta.get("category", {}).get("confidence")
+                confidence_str = f"{confidence:.0%}" if confidence else "-"
+
                 df_data.append({
                     "ID": r["id"],
                     "파일명": r["filename"],
                     "모델": MODEL_OPTIONS.get(r["model"], {}).get("name", r["model"]).split(". ")[-1],
+                    "카테고리": category_str if r["success"] else "-",
+                    "신뢰도": confidence_str if r["success"] else "-",
                     "해상도": r["resolution"],
                     "성공": "✅" if r["success"] else "❌",
                     "비용(₩)": f"₩{r['cost_krw']:.2f}" if r["cost_krw"] else "-",
-                    "시간(s)": f"{r['elapsed_time']:.2f}" if r["elapsed_time"] else "-",
+                    "시간": f"{r['elapsed_time']:.1f}s" if r["elapsed_time"] else "-",
                     "일시": r["created_at"][:16] if r["created_at"] else "-"
                 })
 
             df = pd.DataFrame(df_data)
 
-            # 선택 가능한 데이터프레임
+            # 테이블 key 관리 (다이얼로그 닫을 때 선택 초기화용)
+            if "table_key_counter" not in st.session_state:
+                st.session_state.table_key_counter = 0
+
+            # 다이얼로그가 닫혔으면 key 변경하여 선택 초기화
+            if st.session_state.get("dialog_was_open", False):
+                st.session_state.dialog_was_open = False
+                st.session_state.table_key_counter += 1
+
+            table_key = f"db_result_table_{st.session_state.table_key_counter}"
+
+            # 체크박스 선택 가능한 테이블
             event = st.dataframe(
                 df,
                 use_container_width=True,
                 hide_index=True,
                 selection_mode="single-row",
                 on_select="rerun",
-                key="db_table"
+                key=table_key
             )
 
-            # 선택된 행이 있으면 상세 정보 표시
+            # 선택된 행이 있으면 바로 다이얼로그 표시
             if event.selection and event.selection.rows:
                 selected_row_idx = event.selection.rows[0]
                 selected_id = df_data[selected_row_idx]["ID"]
