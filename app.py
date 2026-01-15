@@ -1441,7 +1441,6 @@ def main():
         with col1:
             if st.button("📥 결과 Excel 다운로드", use_container_width=True):
                 import pandas as pd
-                import io
 
                 rows = []
                 for item in st.session_state.results:
@@ -1820,7 +1819,6 @@ def main():
 
                     if all_results:
                         import pandas as pd
-                        import io
 
                         excel_rows = []
                         for r in all_results:
