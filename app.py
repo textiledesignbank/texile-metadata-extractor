@@ -40,6 +40,10 @@ def get_api_key(key_name: str) -> str:
 GEMINI_API_KEY = get_api_key("GEMINI_API_KEY")
 OPENAI_API_KEY = get_api_key("OPENAI_API_KEY")
 
+# 어드민 계정 (로컬: .env, 배포: Streamlit Secrets)
+ADMIN_USERNAME = get_api_key("ADMIN_USERNAME") or "admin"
+ADMIN_PASSWORD = get_api_key("ADMIN_PASSWORD") or "admin123"
+
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
@@ -47,6 +51,43 @@ if OPENAI_API_KEY:
     openai_client = OpenAI(api_key=OPENAI_API_KEY)
 else:
     openai_client = None
+
+
+# ============================================
+# 로그인 기능
+# ============================================
+
+def show_login_page():
+    """로그인 페이지 표시"""
+    st.title("🔐 로그인")
+    st.caption("텍스타일 이미지 메타데이터 추출기")
+
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        with st.form("login_form"):
+            username = st.text_input("아이디")
+            password = st.text_input("비밀번호", type="password")
+            submit = st.form_submit_button("로그인", use_container_width=True)
+
+            if submit:
+                if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
+                    st.session_state.logged_in = True
+                    st.rerun()
+                else:
+                    st.error("아이디 또는 비밀번호가 올바르지 않습니다.")
+
+
+def check_login():
+    """로그인 상태 확인"""
+    if "logged_in" not in st.session_state:
+        st.session_state.logged_in = False
+    return st.session_state.logged_in
+
+
+def logout():
+    """로그아웃"""
+    st.session_state.logged_in = False
+    st.rerun()
 
 # 환율
 EXCHANGE_RATE = 1470  # ₩1,470/$1
@@ -118,17 +159,42 @@ def save_result_to_db(result_data: dict):
     conn.commit()
     conn.close()
 
-def load_results_from_db(limit: int = 100, offset: int = 0):
-    """DB에서 분석 결과 불러오기 (페이지네이션 지원)"""
+def load_results_from_db(limit: int = 100, offset: int = 0, model_filter: str = None, resolution_filter: str = None, success_filter: str = None):
+    """DB에서 분석 결과 불러오기 (페이지네이션 + 필터 지원)"""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
-    cursor.execute("""
+    # 동적 WHERE 절 구성
+    conditions = []
+    params = []
+
+    if model_filter and model_filter != "전체":
+        conditions.append("model = ?")
+        params.append(model_filter)
+
+    if resolution_filter and resolution_filter != "전체":
+        conditions.append("resolution = ?")
+        params.append(resolution_filter)
+
+    if success_filter == "성공만":
+        conditions.append("success = 1")
+    elif success_filter == "실패만":
+        conditions.append("success = 0")
+
+    where_clause = ""
+    if conditions:
+        where_clause = "WHERE " + " AND ".join(conditions)
+
+    query = f"""
         SELECT * FROM analysis_results
-        ORDER BY created_at DESC
+        {where_clause}
+        ORDER BY id DESC
         LIMIT ? OFFSET ?
-    """, (limit, offset))
+    """
+    params.extend([limit, offset])
+
+    cursor.execute(query, params)
 
     rows = cursor.fetchall()
     conn.close()
@@ -151,6 +217,38 @@ def load_results_from_db(limit: int = 100, offset: int = 0):
         })
 
     return results
+
+
+def get_filtered_count(model_filter: str = None, resolution_filter: str = None, success_filter: str = None) -> int:
+    """필터 적용된 결과 개수 조회"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    conditions = []
+    params = []
+
+    if model_filter and model_filter != "전체":
+        conditions.append("model = ?")
+        params.append(model_filter)
+
+    if resolution_filter and resolution_filter != "전체":
+        conditions.append("resolution = ?")
+        params.append(resolution_filter)
+
+    if success_filter == "성공만":
+        conditions.append("success = 1")
+    elif success_filter == "실패만":
+        conditions.append("success = 0")
+
+    where_clause = ""
+    if conditions:
+        where_clause = "WHERE " + " AND ".join(conditions)
+
+    cursor.execute(f"SELECT COUNT(*) FROM analysis_results {where_clause}", params)
+    count = cursor.fetchone()[0]
+    conn.close()
+
+    return count
 
 def get_db_stats():
     """DB 통계 조회"""
@@ -266,43 +364,50 @@ Your analysis must be:
 
 Output your analysis as valid JSON only, no additional text."""
 
-ANALYSIS_PROMPT = """Analyze this textile/pattern design image and provide metadata in the following JSON structure:
+# 카테고리 목록 (영어)
+CATEGORY_OPTIONS = [
+    "Natural", "Traditional", "Floral", "Ethnic", "Abstract", "Stripe",
+    "Tropical", "Camouflage", "Geometric", "Animal", "Conversational",
+    "Check", "Paisley", "Tie-dye", "Animal Skins", "Dot", "Heart",
+    "Star", "Ditsy", "Patchwork"
+]
 
-{
-  "category": {
-    "primary": "main category (floral/geometric/ethnic/animal/nature/abstract/novelty)",
-    "secondary": ["subcategories"],
+ANALYSIS_PROMPT = f"""Analyze this textile/pattern design image and provide metadata in the following JSON structure:
+
+{{
+  "category": {{
+    "matches": ["top 3 categories in order of relevance - first is most relevant (MUST be from: {', '.join(CATEGORY_OPTIONS)})"],
     "confidence": 0.0-1.0
-  },
-  "colors": {
+  }},
+  "colors": {{
     "dominant": ["#hex1", "#hex2", "#hex3"],
     "palette_name": "descriptive name",
     "mood": "warm/cool/neutral/vibrant/muted"
-  },
-  "style": {
+  }},
+  "style": {{
     "type": "style name",
     "era": "time period if applicable",
     "technique": "apparent technique"
-  },
-  "pattern": {
+  }},
+  "pattern": {{
     "scale": "small/medium/large",
     "repeat_type": "block/brick/half-drop/mirror/random",
     "density": "sparse/moderate/dense"
-  },
-  "mood": {
+  }},
+  "mood": {{
     "primary": "main mood",
     "secondary": ["other moods"]
-  },
-  "keywords": {
+  }},
+  "keywords": {{
     "search_tags": ["tag1", "tag2", "tag3", "tag4", "tag5"],
     "description": "One sentence description for search"
-  },
-  "usage_suggestion": {
+  }},
+  "usage_suggestion": {{
     "products": ["product1", "product2"],
     "season": ["season1"],
     "target_market": ["market1"]
-  }
-}
+  }}
+}}
 
 Return ONLY the JSON, no other text."""
 
@@ -542,12 +647,215 @@ def analyze_image(image: Image.Image, model_id: str, resolution: str = "medium")
 # Streamlit UI
 # ============================================
 
+def show_detail_inline(result: dict):
+    """분석 결과 상세 정보 인라인 표시"""
+    st.subheader(f"📋 상세 정보: #{result['id']} - {result['filename']}")
+
+    col1, col2 = st.columns([1, 2])
+
+    with col1:
+        # 이미지 표시
+        if result.get("image_data"):
+            st.image(
+                f"data:image/png;base64,{result['image_data']}",
+                caption=result['filename'],
+                use_container_width=True
+            )
+        else:
+            st.warning("이미지 없음")
+
+        # 기본 정보
+        st.markdown("**기본 정보**")
+        st.caption(f"모델: {result['model']}")
+        st.caption(f"해상도: {result['resolution']}")
+        st.caption(f"비용: ₩{result['cost_krw']:.2f}")
+        st.caption(f"시간: {result['elapsed_time']:.2f}s")
+        st.caption(f"일시: {result['created_at']}")
+
+    with col2:
+        metadata = result["metadata"]
+
+        # 카테고리
+        category = metadata.get("category", {})
+        matches = category.get("matches", [])
+        if matches:
+            st.markdown(f"### 카테고리: {', '.join(matches)}")
+        else:
+            # 기존 형식 호환
+            primary = category.get('primary', 'N/A')
+            secondary = category.get('secondary', [])
+            all_cats = [primary] + secondary if secondary else [primary]
+            st.markdown(f"### 카테고리: {', '.join(all_cats)}")
+        if category.get("confidence"):
+            st.caption(f"신뢰도: {category.get('confidence', 0):.0%}")
+
+        # 스타일 & 무드
+        col_a, col_b = st.columns(2)
+        with col_a:
+            style = metadata.get("style", {})
+            st.markdown(f"**스타일:** {style.get('type', 'N/A')}")
+            if style.get("era"):
+                st.caption(f"시대: {style.get('era')}")
+            if style.get("technique"):
+                st.caption(f"기법: {style.get('technique')}")
+        with col_b:
+            mood = metadata.get("mood", {})
+            st.markdown(f"**무드:** {mood.get('primary', 'N/A')}")
+            if mood.get("secondary"):
+                st.caption(f"부가: {', '.join(mood.get('secondary', []))}")
+
+        # 색상
+        colors = metadata.get("colors", {})
+        dominant = colors.get("dominant", [])
+        if dominant:
+            color_html = " ".join([
+                f'<span style="background-color:{c};padding:8px 16px;border-radius:4px;margin:2px;border:1px solid #ccc;">{c}</span>'
+                for c in dominant
+            ])
+            st.markdown(f"**색상:** {color_html}", unsafe_allow_html=True)
+            if colors.get("palette_name"):
+                st.caption(f"팔레트: {colors.get('palette_name')} | 무드: {colors.get('mood', 'N/A')}")
+
+        # 패턴
+        pattern = metadata.get("pattern", {})
+        if pattern:
+            st.markdown(f"**패턴:** {pattern.get('scale', 'N/A')} / {pattern.get('repeat_type', 'N/A')} / {pattern.get('density', 'N/A')}")
+
+        # 키워드
+        keywords = metadata.get("keywords", {})
+        if keywords.get("search_tags"):
+            st.markdown(f"**키워드:** `{'`, `'.join(keywords.get('search_tags', []))}`")
+        if keywords.get("description"):
+            st.info(keywords.get("description"))
+
+        # 용도 제안
+        usage = metadata.get("usage_suggestion", {})
+        if usage:
+            st.markdown("**용도 제안:**")
+            usage_text = []
+            if usage.get("products"):
+                usage_text.append(f"제품: {', '.join(usage.get('products', []))}")
+            if usage.get("season"):
+                usage_text.append(f"시즌: {', '.join(usage.get('season', []))}")
+            if usage.get("target_market"):
+                usage_text.append(f"타겟: {', '.join(usage.get('target_market', []))}")
+            st.caption(" | ".join(usage_text))
+
+    # 전체 JSON
+    with st.expander("📄 전체 JSON 데이터"):
+        st.json(metadata)
+
+
+@st.dialog("📋 상세 정보", width="large")
+def show_detail_dialog(result: dict):
+    """분석 결과 상세 정보 다이얼로그"""
+    col1, col2 = st.columns([1, 2])
+
+    with col1:
+        # 이미지 표시
+        if result.get("image_data"):
+            st.image(
+                f"data:image/png;base64,{result['image_data']}",
+                caption=result['filename'],
+                use_container_width=True
+            )
+        else:
+            st.warning("이미지 없음")
+
+        # 기본 정보
+        st.markdown("**기본 정보**")
+        st.caption(f"ID: #{result['id']}")
+        st.caption(f"파일: {result['filename']}")
+        st.caption(f"모델: {result['model']}")
+        st.caption(f"해상도: {result['resolution']}")
+        st.caption(f"비용: ₩{result['cost_krw']:.2f}")
+        st.caption(f"시간: {result['elapsed_time']:.2f}s")
+        st.caption(f"일시: {result['created_at']}")
+
+    with col2:
+        metadata = result["metadata"]
+
+        # 카테고리
+        category = metadata.get("category", {})
+        matches = category.get("matches", [])
+        if matches:
+            st.markdown(f"### 카테고리: {', '.join(matches)}")
+        else:
+            # 기존 형식 호환
+            primary = category.get('primary', 'N/A')
+            secondary = category.get('secondary', [])
+            all_cats = [primary] + secondary if secondary else [primary]
+            st.markdown(f"### 카테고리: {', '.join(all_cats)}")
+        if category.get("confidence"):
+            st.caption(f"신뢰도: {category.get('confidence', 0):.0%}")
+
+        # 스타일
+        style = metadata.get("style", {})
+        st.markdown(f"**스타일:** {style.get('type', 'N/A')}")
+        if style.get("era"):
+            st.caption(f"시대: {style.get('era')}")
+        if style.get("technique"):
+            st.caption(f"기법: {style.get('technique')}")
+
+        # 무드
+        mood = metadata.get("mood", {})
+        st.markdown(f"**무드:** {mood.get('primary', 'N/A')}")
+        if mood.get("secondary"):
+            st.caption(f"부가: {', '.join(mood.get('secondary', []))}")
+
+        # 색상
+        colors = metadata.get("colors", {})
+        dominant = colors.get("dominant", [])
+        if dominant:
+            color_html = " ".join([
+                f'<span style="background-color:{c};padding:8px 16px;border-radius:4px;margin:2px;border:1px solid #ccc;">{c}</span>'
+                for c in dominant
+            ])
+            st.markdown(f"**색상:** {color_html}", unsafe_allow_html=True)
+            if colors.get("palette_name"):
+                st.caption(f"팔레트: {colors.get('palette_name')}")
+            if colors.get("mood"):
+                st.caption(f"색상 무드: {colors.get('mood')}")
+
+        # 패턴
+        pattern = metadata.get("pattern", {})
+        if pattern:
+            st.markdown(f"**패턴:** {pattern.get('scale', 'N/A')} / {pattern.get('repeat_type', 'N/A')} / {pattern.get('density', 'N/A')}")
+
+        # 키워드
+        keywords = metadata.get("keywords", {})
+        if keywords.get("search_tags"):
+            st.markdown(f"**키워드:** `{'`, `'.join(keywords.get('search_tags', []))}`")
+        if keywords.get("description"):
+            st.info(keywords.get("description"))
+
+        # 용도 제안
+        usage = metadata.get("usage_suggestion", {})
+        if usage:
+            st.markdown("**용도 제안:**")
+            if usage.get("products"):
+                st.caption(f"제품: {', '.join(usage.get('products', []))}")
+            if usage.get("season"):
+                st.caption(f"시즌: {', '.join(usage.get('season', []))}")
+            if usage.get("target_market"):
+                st.caption(f"타겟: {', '.join(usage.get('target_market', []))}")
+
+    # 전체 JSON
+    with st.expander("📄 전체 JSON 데이터"):
+        st.json(metadata)
+
+
 def main():
     st.set_page_config(
-        page_title="Textile Metadata Extractor - 5 Model Test",
+        page_title="Textile Metadata Extractor",
         page_icon="🎨",
         layout="wide"
     )
+
+    # 로그인 체크
+    if not check_login():
+        show_login_page()
+        st.stop()
 
     st.title("🎨 텍스타일 이미지 메타데이터 추출기")
 
@@ -581,6 +889,15 @@ def main():
     # ============================================
 
     with st.sidebar:
+        # 로그아웃 버튼
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.caption(f"👤 {ADMIN_USERNAME}")
+        with col2:
+            if st.button("🚪", help="로그아웃"):
+                logout()
+
+        st.divider()
         st.header("⚙️ 설정")
 
         # 테스트 모드 선택
@@ -791,7 +1108,9 @@ def main():
                                     st.success(f"✅ {result['elapsed_time']:.2f}s | ₩{result['cost']['krw']:.2f}")
 
                                     metadata = result["metadata"]
-                                    st.markdown(f"**카테고리:** {metadata.get('category', {}).get('primary', 'N/A')}")
+                                    cat_matches = metadata.get('category', {}).get('matches', [])
+                                    cat_display = ', '.join(cat_matches) if cat_matches else metadata.get('category', {}).get('primary', 'N/A')
+                                    st.markdown(f"**카테고리:** {cat_display}")
                                     st.markdown(f"**스타일:** {metadata.get('style', {}).get('type', 'N/A')}")
                                     st.markdown(f"**무드:** {metadata.get('mood', {}).get('primary', 'N/A')}")
 
@@ -840,7 +1159,9 @@ def main():
                     if item["result"]["success"]:
                         metadata = item["result"]["metadata"]
 
-                        st.markdown(f"**카테고리:** {metadata.get('category', {}).get('primary', 'N/A')}")
+                        cat_matches = metadata.get('category', {}).get('matches', [])
+                        cat_display = ', '.join(cat_matches) if cat_matches else metadata.get('category', {}).get('primary', 'N/A')
+                        st.markdown(f"**카테고리:** {cat_display}")
                         st.markdown(f"**스타일:** {metadata.get('style', {}).get('type', 'N/A')}")
                         st.markdown(f"**무드:** {metadata.get('mood', {}).get('primary', 'N/A')}")
 
@@ -874,11 +1195,12 @@ def main():
                 for item in st.session_state.results:
                     if item["result"]["success"]:
                         m = item["result"]["metadata"]
+                        cat_matches = m.get("category", {}).get("matches", [])
                         rows.append({
                             "filename": item["filename"],
                             "model": item["model"],
                             "resolution": item["resolution"],
-                            "category": m.get("category", {}).get("primary", ""),
+                            "category": ", ".join(cat_matches) if cat_matches else m.get("category", {}).get("primary", ""),
                             "style": m.get("style", {}).get("type", ""),
                             "mood": m.get("mood", {}).get("primary", ""),
                             "colors": ", ".join(m.get("colors", {}).get("dominant", [])),
@@ -935,9 +1257,46 @@ def main():
     st.divider()
     st.subheader("💾 저장된 분석 결과 (DB)")
 
-    # 총 개수 조회
+    # 필터 옵션
+    filter_col1, filter_col2, filter_col3 = st.columns([1, 1, 2])
+
+    with filter_col1:
+        # 모델 필터
+        model_options = ["전체"] + list(MODEL_OPTIONS.keys())
+        selected_model_filter = st.selectbox(
+            "모델 필터",
+            options=model_options,
+            format_func=lambda x: "전체" if x == "전체" else MODEL_OPTIONS.get(x, {}).get("name", x).split(". ")[-1]
+        )
+
+    with filter_col2:
+        # 해상도 필터
+        resolution_options = ["전체", "low", "medium", "high"]
+        selected_resolution_filter = st.selectbox(
+            "해상도 필터",
+            options=resolution_options
+        )
+
+    with filter_col3:
+        # 성공/실패 필터
+        success_options = ["전체", "성공만", "실패만"]
+        selected_success_filter = st.selectbox(
+            "결과 필터",
+            options=success_options
+        )
+
+    # 필터 적용된 총 개수 조회
+    filtered_count = get_filtered_count(
+        model_filter=selected_model_filter,
+        resolution_filter=selected_resolution_filter,
+        success_filter=selected_success_filter
+    )
     db_stats = get_db_stats()
     total_count = db_stats["total_count"]
+
+    # 필터 상태 표시
+    if selected_model_filter != "전체" or selected_resolution_filter != "전체" or selected_success_filter != "전체":
+        st.info(f"🔍 필터 적용됨: {filtered_count}건 / 전체 {total_count}건")
 
     # CSV 내보내기 버튼
     col_export1, col_export2 = st.columns([1, 3])
@@ -966,8 +1325,8 @@ def main():
                     # 메타데이터 필드 추가
                     if r["success"] and r["metadata"]:
                         m = r["metadata"]
-                        row["카테고리"] = m.get("category", {}).get("primary", "")
-                        row["카테고리_부가"] = ", ".join(m.get("category", {}).get("secondary", []))
+                        cat_matches = m.get("category", {}).get("matches", [])
+                        row["카테고리"] = ", ".join(cat_matches) if cat_matches else m.get("category", {}).get("primary", "")
                         row["스타일"] = m.get("style", {}).get("type", "")
                         row["스타일_시대"] = m.get("style", {}).get("era", "")
                         row["스타일_기법"] = m.get("style", {}).get("technique", "")
@@ -1006,12 +1365,27 @@ def main():
     # 페이지네이션 설정
     items_per_page = st.selectbox("페이지당 항목 수", [10, 20, 50], index=0)
 
-    if total_count > 0:
-        total_pages = (total_count + items_per_page - 1) // items_per_page
+    # 필터 적용된 개수로 페이지네이션
+    display_count = filtered_count if (selected_model_filter != "전체" or selected_resolution_filter != "전체" or selected_success_filter != "전체") else total_count
+
+    if display_count > 0:
+        total_pages = (display_count + items_per_page - 1) // items_per_page
 
         # 페이지 선택
         if "db_page" not in st.session_state:
             st.session_state.db_page = 1
+
+        # 필터 변경 시 페이지 리셋
+        filter_key = f"{selected_model_filter}_{selected_resolution_filter}_{selected_success_filter}"
+        if "last_filter_key" not in st.session_state:
+            st.session_state.last_filter_key = filter_key
+        if st.session_state.last_filter_key != filter_key:
+            st.session_state.db_page = 1
+            st.session_state.last_filter_key = filter_key
+
+        # 페이지 범위 조정
+        if st.session_state.db_page > total_pages:
+            st.session_state.db_page = max(1, total_pages)
 
         col1, col2, col3 = st.columns([1, 2, 1])
         with col1:
@@ -1019,20 +1393,28 @@ def main():
                 st.session_state.db_page -= 1
                 st.rerun()
         with col2:
-            st.markdown(f"<center>페이지 {st.session_state.db_page} / {total_pages} (총 {total_count}건)</center>", unsafe_allow_html=True)
+            st.markdown(f"<center>페이지 {st.session_state.db_page} / {total_pages} (총 {display_count}건)</center>", unsafe_allow_html=True)
         with col3:
             if st.button("다음 ▶", disabled=st.session_state.db_page >= total_pages):
                 st.session_state.db_page += 1
                 st.rerun()
 
-        # 현재 페이지 데이터 조회
+        # 현재 페이지 데이터 조회 (필터 적용)
         offset = (st.session_state.db_page - 1) * items_per_page
-        db_results = load_results_from_db(limit=items_per_page, offset=offset)
+        db_results = load_results_from_db(
+            limit=items_per_page,
+            offset=offset,
+            model_filter=selected_model_filter,
+            resolution_filter=selected_resolution_filter,
+            success_filter=selected_success_filter
+        )
 
         if db_results:
             import pandas as pd
 
-            # 요약 테이블
+            st.caption("📌 테이블에서 행을 선택하면 상세 정보를 볼 수 있습니다.")
+
+            # 테이블 데이터 구성
             df_data = []
             for r in db_results:
                 df_data.append({
@@ -1046,112 +1428,26 @@ def main():
                     "일시": r["created_at"][:16] if r["created_at"] else "-"
                 })
 
-            st.dataframe(pd.DataFrame(df_data), use_container_width=True, hide_index=True)
+            df = pd.DataFrame(df_data)
 
-            # 상세 보기 선택
-            st.divider()
-            st.caption("🔍 상세 보기할 항목 선택:")
+            # 선택 가능한 데이터프레임
+            event = st.dataframe(
+                df,
+                use_container_width=True,
+                hide_index=True,
+                selection_mode="single-row",
+                on_select="rerun",
+                key="db_table"
+            )
 
-            # ID 선택
-            available_ids = [r["id"] for r in db_results if r["success"]]
-            if available_ids:
-                selected_id = st.selectbox(
-                    "결과 ID 선택",
-                    options=available_ids,
-                    format_func=lambda x: f"#{x} - {next((r['filename'] for r in db_results if r['id'] == x), 'N/A')}"
-                )
-
-                # 선택된 항목 상세 표시
+            # 선택된 행이 있으면 상세 정보 표시
+            if event.selection and event.selection.rows:
+                selected_row_idx = event.selection.rows[0]
+                selected_id = df_data[selected_row_idx]["ID"]
                 selected_result = next((r for r in db_results if r["id"] == selected_id), None)
-                if selected_result and selected_result["metadata"]:
-                    st.markdown("---")
-                    st.subheader(f"📋 상세 정보: #{selected_result['id']}")
 
-                    col1, col2 = st.columns([1, 2])
-
-                    with col1:
-                        # 이미지 표시
-                        if selected_result.get("image_data"):
-                            st.image(
-                                f"data:image/png;base64,{selected_result['image_data']}",
-                                caption=selected_result['filename'],
-                                use_container_width=True
-                            )
-                        else:
-                            st.warning("이미지 없음")
-
-                        # 기본 정보
-                        st.caption(f"**모델:** {selected_result['model']}")
-                        st.caption(f"**해상도:** {selected_result['resolution']}")
-                        st.caption(f"**비용:** ₩{selected_result['cost_krw']:.2f}")
-                        st.caption(f"**시간:** {selected_result['elapsed_time']:.2f}s")
-                        st.caption(f"**일시:** {selected_result['created_at']}")
-
-                    with col2:
-                        metadata = selected_result["metadata"]
-
-                        # 카테고리
-                        category = metadata.get("category", {})
-                        st.markdown(f"### 카테고리: {category.get('primary', 'N/A')}")
-                        if category.get("secondary"):
-                            st.caption(f"부가: {', '.join(category.get('secondary', []))}")
-                        if category.get("confidence"):
-                            st.caption(f"신뢰도: {category.get('confidence', 0):.0%}")
-
-                        # 스타일
-                        style = metadata.get("style", {})
-                        st.markdown(f"**스타일:** {style.get('type', 'N/A')}")
-                        if style.get("era"):
-                            st.caption(f"시대: {style.get('era')}")
-                        if style.get("technique"):
-                            st.caption(f"기법: {style.get('technique')}")
-
-                        # 무드
-                        mood = metadata.get("mood", {})
-                        st.markdown(f"**무드:** {mood.get('primary', 'N/A')}")
-                        if mood.get("secondary"):
-                            st.caption(f"부가: {', '.join(mood.get('secondary', []))}")
-
-                        # 색상
-                        colors = metadata.get("colors", {})
-                        dominant = colors.get("dominant", [])
-                        if dominant:
-                            color_html = " ".join([
-                                f'<span style="background-color:{c};padding:8px 16px;border-radius:4px;margin:2px;border:1px solid #ccc;">{c}</span>'
-                                for c in dominant
-                            ])
-                            st.markdown(f"**색상:** {color_html}", unsafe_allow_html=True)
-                            if colors.get("palette_name"):
-                                st.caption(f"팔레트: {colors.get('palette_name')}")
-                            if colors.get("mood"):
-                                st.caption(f"색상 무드: {colors.get('mood')}")
-
-                        # 패턴
-                        pattern = metadata.get("pattern", {})
-                        if pattern:
-                            st.markdown(f"**패턴:** {pattern.get('scale', 'N/A')} / {pattern.get('repeat_type', 'N/A')} / {pattern.get('density', 'N/A')}")
-
-                        # 키워드
-                        keywords = metadata.get("keywords", {})
-                        if keywords.get("search_tags"):
-                            st.markdown(f"**키워드:** `{'`, `'.join(keywords.get('search_tags', []))}`")
-                        if keywords.get("description"):
-                            st.info(keywords.get("description"))
-
-                        # 용도 제안
-                        usage = metadata.get("usage_suggestion", {})
-                        if usage:
-                            st.markdown("**용도 제안:**")
-                            if usage.get("products"):
-                                st.caption(f"제품: {', '.join(usage.get('products', []))}")
-                            if usage.get("season"):
-                                st.caption(f"시즌: {', '.join(usage.get('season', []))}")
-                            if usage.get("target_market"):
-                                st.caption(f"타겟: {', '.join(usage.get('target_market', []))}")
-
-                    # 전체 JSON
-                    with st.expander("📄 전체 JSON 데이터"):
-                        st.json(metadata)
+                if selected_result and selected_result["success"] and selected_result["metadata"]:
+                    show_detail_dialog(selected_result)
     else:
         st.info("저장된 결과가 없습니다.")
 
