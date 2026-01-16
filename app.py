@@ -89,7 +89,7 @@ EXCHANGE_RATE = 1470  # ₩1,470/$1
 # SQLite 데이터베이스 설정
 # ============================================
 
-DB_PATH = "results.db"
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results.db")
 
 def init_db():
     """데이터베이스 초기화 및 테이블 생성"""
@@ -555,6 +555,7 @@ def get_same_image_comparison():
                 "usage_products": usage_data.get("products", []),
                 "usage_season": usage_data.get("season", []),
                 "usage_target": usage_data.get("target_market", []),
+                "usage_fabrics": usage_data.get("fabrics", []),
             })
 
         comparisons.append(file_comparison)
@@ -727,7 +728,8 @@ ANALYSIS_PROMPT = f"""Analyze this textile/pattern design image and provide meta
   "usage_suggestion": {{
     "products": ["product1", "product2"],
     "season": ["season1"],
-    "target_market": ["market1"]
+    "target_market": ["market1"],
+    "fabrics": ["MUST be from: cotton, silk, polyester, linen, wool, nylon, rayon, denim, velvet, satin, chiffon, leather"]
   }}
 }}
 
@@ -937,6 +939,8 @@ def show_detail_inline(result: dict):
                 usage_text.append(f"시즌: {', '.join(usage.get('season', []))}")
             if usage.get("target_market"):
                 usage_text.append(f"타겟: {', '.join(usage.get('target_market', []))}")
+            if usage.get("fabrics"):
+                usage_text.append(f"추천원단: {', '.join(usage.get('fabrics', []))}")
             st.caption(" | ".join(usage_text))
 
     # 전체 JSON
@@ -1037,6 +1041,8 @@ def show_detail_dialog(result: dict):
                 st.caption(f"시즌: {', '.join(usage.get('season', []))}")
             if usage.get("target_market"):
                 st.caption(f"타겟: {', '.join(usage.get('target_market', []))}")
+            if usage.get("fabrics"):
+                st.caption(f"추천원단: {', '.join(usage.get('fabrics', []))}")
 
     # 전체 JSON
     with st.expander("📄 전체 JSON 데이터"):
@@ -1053,7 +1059,7 @@ def main():
         layout="wide"
     )
 
-    # 사이드바 토글 버튼 - 항상 보이게 (hover 없이도)
+    # 커스텀 스타일
     st.markdown("""
         <style>
         /* 사이드바 접기 버튼 - 항상 표시 */
@@ -1067,6 +1073,25 @@ def main():
             visibility: visible !important;
             color: inherit !important;
         }
+        /* 컴팩트 메트릭 */
+        [data-testid="stMetric"] {
+            padding: 0.5rem 0;
+        }
+        [data-testid="stMetric"] label {
+            font-size: 0.85rem;
+        }
+        /* 탭 간격 조정 */
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 8px;
+        }
+        /* 버튼 간격 */
+        .stButton > button {
+            padding: 0.4rem 1rem;
+        }
+        /* selectbox 높이 조정 */
+        [data-testid="stSelectbox"] {
+            min-height: auto;
+        }
         </style>
     """, unsafe_allow_html=True)
 
@@ -1077,83 +1102,19 @@ def main():
 
     st.title("🎨 텍스타일 이미지 메타데이터 추출기")
 
-    # 사용법 가이드
-    with st.expander("📖 **사용법 가이드**", expanded=True):
+    # 사용법 가이드 (간소화, 기본 접힘)
+    with st.expander("📖 사용법 가이드", expanded=False):
         st.markdown("""
-        <div style="max-height: 400px; overflow-y: auto; padding-right: 10px;">
+        **🎯 서비스**: 텍스타일 이미지 AI 분석 → 카테고리, 색상, 스타일, 무드, 패턴, 키워드, 추천원단 추출
 
-        ### 🎯 서비스 소개
-        텍스타일 이미지를 AI로 분석하여 **카테고리, 색상, 스타일, 무드, 패턴, 키워드** 등의 메타데이터를 자동으로 추출하는 도구입니다.
+        | 해상도 | 토큰 | 용도 |
+        |:---:|:---:|---|
+        | low | 280 | 빠른 테스트 (기본) |
+        | medium | 560 | 일반 분석 |
+        | high | 1,120 | 정밀 분석 |
 
-        ---
-
-        ### 🔬 테스트 모드 (사이드바)
-
-        | 모드 | 설명 | 용도 |
-        |------|------|------|
-        | **단일 모델** | 선택한 1개 모델로 분석 | 빠른 분석, 일반 사용 |
-        | **모델 비교** | 여러 모델로 동일 이미지 분석 | 모델 성능 비교, 일관성 테스트 |
-
-        ---
-
-        ### 📤 분석하기 탭
-
-        **1. 이미지 해상도 설정**
-
-        | 해상도 | 토큰 수 | 비용 | 권장 용도 |
-        |--------|---------|------|-----------|
-        | low | 280 | 최저 | 빠른 테스트, 대량 처리 (기본값) |
-        | medium | 560 | 중간 | 일반 분석 |
-        | high | 1,120 | 최고 | 정밀 분석, 복잡한 패턴 |
-
-        **2. 이미지 업로드**
-        - 지원 형식: PNG, JPG, JPEG, WEBP
-        - 여러 이미지 동시 업로드 가능
-        - 업로드 후 썸네일 미리보기 제공
-
-        **3. 분석 실행**
-        - `🔍 n개 이미지 분석` 버튼 클릭
-        - 분석 진행률 및 예상 시간 표시
-        - 완료 후 결과 자동 DB 저장
-
-        **4. 결과 확인**
-        - 각 이미지별 분석 결과 토글로 표시
-        - 카테고리, 색상, 스타일, 무드, 패턴, 키워드 등 상세 정보
-        - 비용 및 처리 시간 표시
-
-        ---
-
-        ### 💾 저장된 결과 탭
-
-        **📊 모델 비교 분석**
-        - **수치형 통계**: 모델별 성공률, 비용, 처리시간 비교
-        - **신뢰도 통계**: 모델별 분류 신뢰도 분포
-        - **동일 이미지 비교**: 같은 이미지의 모델별 분석 결과 비교
-
-        **📋 데이터 조회**
-        - 필터: 모델, 해상도, 성공/실패별 조회
-        - 페이지네이션: 페이지당 10개씩 표시
-        - 삭제: 선택한 항목 일괄 삭제 가능
-
-        ---
-
-        ### 💡 팁
-
-        - **비용 절약**: `low` 해상도로 대량 처리 시 최대 75% 비용 절감
-        - **모델 비교**: 동일 이미지를 여러 모델로 분석하여 일관성 확인
-        - **결과 초기화**: 세션 결과만 초기화 (DB 데이터는 유지)
-        - **사이드바 접기**: 좌측 상단 화살표로 사이드바 접기/펼치기
-
-        ---
-
-        ### ⚠️ 주의사항
-
-        - API 호출 시 비용이 발생합니다 (Gemini API)
-        - 대량 이미지 분석 시 예상 비용을 확인하세요
-        - 분석 중 브라우저를 닫으면 진행 중인 분석이 중단됩니다
-
-        </div>
-        """, unsafe_allow_html=True)
+        **💡 Tip**: 사이드바에서 단일/비교 모드 선택 • 결과는 자동 DB 저장 • Excel 내보내기 지원
+        """)
 
     # API 키 확인
     if GEMINI_API_KEY:
@@ -1228,40 +1189,38 @@ def main():
     tab1, tab2 = st.tabs(["📤 분석하기", "💾 저장된 결과"])
 
     with tab1:
-        # 설정 영역
-        setting_col1, setting_col2, setting_col3 = st.columns([1, 1, 2])
+        # 설정 + 비용 통합 영역 (컴팩트)
+        col_res, col_cost1, col_cost2, col_reset = st.columns([2, 1.5, 1.5, 1])
 
-        with setting_col1:
-            # 해상도 설정
+        with col_res:
             resolution = st.select_slider(
-                "🖼️ 이미지 해상도",
+                "해상도",
                 options=["low", "medium", "high"],
                 value="low",
-                help="low: 최저 비용 (280 tokens)\nmedium: 기본 (560 tokens)\nhigh: 고품질 (1120 tokens)"
+                help="low(280) • medium(560) • high(1120) 토큰"
             )
-            st.caption(f"토큰: {MODEL_OPTIONS['gemini-2.0-flash-lite']['tokens_per_image'][resolution]}/이미지")
 
-        with setting_col2:
-            # 현재 세션 비용
-            total_cost = sum(r["result"]["cost"]["total"] for r in st.session_state.results if r["result"]["success"])
-            total_krw = total_cost * EXCHANGE_RATE
-            image_count = len([r for r in st.session_state.results if r["result"]["success"]])
-            st.metric("💰 세션 비용", f"₩{total_krw:.1f}", delta=f"{image_count}건")
+        # 비용 계산
+        total_cost = sum(r["result"]["cost"]["total"] for r in st.session_state.results if r["result"]["success"])
+        total_krw = total_cost * EXCHANGE_RATE
+        image_count = len([r for r in st.session_state.results if r["result"]["success"]])
 
-        with setting_col3:
-            # 1200개 예상 비용 및 초기화
+        with col_cost1:
+            st.metric("세션 비용", f"₩{total_krw:.0f}", delta=f"{image_count}건" if image_count else None)
+
+        with col_cost2:
             if image_count > 0:
                 avg_cost = total_cost / image_count
-                st.metric("📊 1200개 예상", f"₩{avg_cost * 1200 * EXCHANGE_RATE:.0f}")
+                st.metric("1200개 예상", f"₩{avg_cost * 1200 * EXCHANGE_RATE:,.0f}")
             else:
-                st.metric("📊 1200개 예상", "-")
+                st.metric("1200개 예상", "-")
 
-            if st.button("🔄 결과 초기화", use_container_width=True):
+        with col_reset:
+            st.write("")  # 정렬용
+            if st.button("🔄 초기화", use_container_width=True):
                 st.session_state.results = []
                 st.session_state.comparison_results = []
                 st.rerun()
-
-        st.divider()
 
         # 이미지 업로드
         uploaded_files = st.file_uploader(
@@ -1441,6 +1400,7 @@ def main():
         with col1:
             if st.button("📥 결과 Excel 다운로드", use_container_width=True):
                 import pandas as pd
+                import io
 
                 rows = []
                 for item in st.session_state.results:
@@ -1541,27 +1501,80 @@ def main():
             if model_stats:
                 import pandas as pd
 
-                # 내부 서브탭: 수치형/카테고리 비교/이미지 비교
-                stat_tab1, stat_tab2, stat_tab3 = st.tabs(["📈 수치형 통계", "🎯 신뢰도 통계", "🖼️ 동일 이미지 비교"])
+                # 내부 서브탭: 모델별 통계 / 예상 비용 통계 / 신뢰도 통계
+                stat_tab1, stat_tab2, stat_tab3 = st.tabs(["🖼️ 모델별 통계", "📈 예상 비용 통계", "🎯 신뢰도 통계"])
 
-                # ========== 수치형 통계 탭 ==========
+                # ========== 모델별 통계 탭 (구 동일 이미지 비교) ==========
                 with stat_tab1:
-                    st.subheader("📈 수치형 데이터 통계")
+                    st.subheader("🖼️ 모델별 상세 비교")
+                    st.caption("같은 이미지를 여러 모델/해상도로 분석한 결과를 상세 비교합니다.")
 
-                    # 1. 기본 통계 테이블
-                    st.markdown("**기본 통계**")
-                    basic_data = []
+                    if image_comparisons:
+                        for comp_idx, comp in enumerate(image_comparisons[:20]):
+                            with st.expander(f"📄 {comp['filename']} ({comp['variant_count']}개 시행)", expanded=(comp_idx == 0)):
+                                if comp["thumbnail"]:
+                                    st.image(
+                                        f"data:image/png;base64,{comp['thumbnail']}",
+                                        caption=comp["filename"],
+                                        width=200
+                                    )
+
+                                st.divider()
+
+                                st.markdown("**📊 시행별 상세 비교** (각 행 = 모델 시행)")
+
+                                comparison_rows = []
+                                for r in comp["results"]:
+                                    model_name = MODEL_OPTIONS.get(r["model"], {}).get("name", r["model"])
+                                    short_name = model_name.split(". ")[-1] if ". " in model_name else model_name
+                                    colors_str = ", ".join(r["colors_dominant"][:3]) if r["colors_dominant"] else "-"
+
+                                    comparison_rows.append({
+                                        "모델": short_name,
+                                        "해상도": r["resolution"],
+                                        "카테고리": ", ".join(r["categories"][:3]) if r["categories"] else "-",
+                                        "신뢰도": f"{r['confidence']:.0%}" if r["confidence"] else "-",
+                                        "스타일": r["style_type"] or "-",
+                                        "시대": r["style_era"] or "-",
+                                        "기법": r["style_technique"] or "-",
+                                        "무드(주)": r["mood_primary"] or "-",
+                                        "무드(부)": ", ".join(r["mood_secondary"][:2]) if r["mood_secondary"] else "-",
+                                        "패턴크기": r["pattern_scale"] or "-",
+                                        "패턴반복": r["pattern_repeat"] or "-",
+                                        "패턴밀도": r["pattern_density"] or "-",
+                                        "색상": colors_str,
+                                        "팔레트": r["colors_palette"] or "-",
+                                        "키워드": ", ".join(r["keywords"][:5]) if r["keywords"] else "-",
+                                        "추천제품": ", ".join(r["usage_products"][:2]) if r["usage_products"] else "-",
+                                        "시즌": ", ".join(r["usage_season"]) if r["usage_season"] else "-",
+                                        "타겟": ", ".join(r["usage_target"][:2]) if r["usage_target"] else "-",
+                                        "추천원단": ", ".join(r["usage_fabrics"][:2]) if r.get("usage_fabrics") else "-",
+                                        "비용($)": f"{r['cost_usd']:.5f}",
+                                        "시간(s)": f"{r['elapsed_time']:.2f}",
+                                    })
+
+                                df_comparison = pd.DataFrame(comparison_rows)
+                                st.dataframe(df_comparison, use_container_width=True, hide_index=True, height=min(600, 75 + len(comparison_rows) * 52))
+                    else:
+                        st.info("동일 이미지를 여러 모델로 분석한 데이터가 없습니다.\n모델 비교 테스트를 실행해주세요.")
+
+                # ========== 예상 비용 통계 탭 ==========
+                with stat_tab2:
+                    st.subheader("📈 예상 비용 통계")
+
+                    # 1. 규모별 예상 비용 테이블 (제일 위)
+                    st.markdown("**규모별 예상 비용 (KRW)**")
+                    scale_data = []
                     for s in model_stats:
                         model_name = MODEL_OPTIONS.get(s["model"], {}).get("name", s["model"])
-                        basic_data.append({
+                        scale_data.append({
                             "모델": model_name.split(". ")[-1] if ". " in model_name else model_name,
                             "해상도": s["resolution"],
-                            "총 분석": s["total_count"],
-                            "성공": s["success_count"],
-                            "실패": s["fail_count"],
-                            "성공률": f"{s['success_rate']:.1f}%",
+                            "1,200개": f"₩{s['cost_per_1200']:,.0f}",
+                            "10,000개": f"₩{s['cost_per_10000']:,.0f}",
+                            "100,000개": f"₩{s['cost_per_100000']:,.0f}",
                         })
-                    st.dataframe(pd.DataFrame(basic_data), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(scale_data), use_container_width=True, hide_index=True)
 
                     st.divider()
 
@@ -1600,27 +1613,28 @@ def main():
 
                     st.divider()
 
-                    # 4. 예상 비용 테이블
-                    st.markdown("**규모별 예상 비용 (KRW)**")
-                    scale_data = []
+                    # 4. 성공률 통계 테이블 (제일 마지막)
+                    st.markdown("**성공률 통계**")
+                    basic_data = []
                     for s in model_stats:
                         model_name = MODEL_OPTIONS.get(s["model"], {}).get("name", s["model"])
-                        scale_data.append({
+                        basic_data.append({
                             "모델": model_name.split(". ")[-1] if ". " in model_name else model_name,
                             "해상도": s["resolution"],
-                            "1,200개": f"₩{s['cost_per_1200']:,.0f}",
-                            "10,000개": f"₩{s['cost_per_10000']:,.0f}",
-                            "100,000개": f"₩{s['cost_per_100000']:,.0f}",
+                            "총 분석": s["total_count"],
+                            "성공": s["success_count"],
+                            "실패": s["fail_count"],
+                            "성공률": f"{s['success_rate']:.1f}%",
                         })
-                    st.dataframe(pd.DataFrame(scale_data), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(basic_data), use_container_width=True, hide_index=True)
 
                     st.divider()
 
-                    # Excel 내보내기
-                    excel_full_stats = []
+                    # CSV 내보내기
+                    csv_full_stats = []
                     for s in model_stats:
                         model_name = MODEL_OPTIONS.get(s["model"], {}).get("name", s["model"])
-                        excel_full_stats.append({
+                        csv_full_stats.append({
                             "모델ID": s["model"],
                             "모델명": model_name,
                             "해상도": s["resolution"],
@@ -1642,21 +1656,17 @@ def main():
                             "100000개예상_KRW": s["cost_per_100000"],
                         })
 
-                    df_stats = pd.DataFrame(excel_full_stats)
-                    excel_buffer = io.BytesIO()
-                    with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                        df_stats.to_excel(writer, sheet_name='수치형통계', index=False)
-                    excel_buffer.seek(0)
+                    df_csv = pd.DataFrame(csv_full_stats)
                     st.download_button(
-                        label="📥 수치형 통계 Excel 다운로드",
-                        data=excel_buffer,
-                        file_name=f"model_stats_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        label="📥 예상 비용 통계 CSV 다운로드",
+                        data=df_csv.to_csv(index=False, encoding="utf-8-sig"),
+                        file_name=f"model_stats_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv",
                         use_container_width=True
                     )
 
                 # ========== 신뢰도 통계 탭 ==========
-                with stat_tab2:
+                with stat_tab3:
                     st.subheader("🎯 카테고리 신뢰도(Confidence) 통계")
 
                     if confidence_stats:
@@ -1674,11 +1684,11 @@ def main():
                             })
                         st.dataframe(pd.DataFrame(conf_data), use_container_width=True, hide_index=True)
 
-                        # Excel 내보내기
-                        excel_conf = []
+                        # CSV 내보내기
+                        csv_conf = []
                         for s in confidence_stats:
                             model_name = MODEL_OPTIONS.get(s["model"], {}).get("name", s["model"])
-                            excel_conf.append({
+                            csv_conf.append({
                                 "모델ID": s["model"],
                                 "모델명": model_name,
                                 "해상도": s["resolution"],
@@ -1688,77 +1698,16 @@ def main():
                                 "최대신뢰도": s["max_confidence"],
                                 "표준편차": s["stddev_confidence"],
                             })
-                        df_conf = pd.DataFrame(excel_conf)
-                        excel_buffer = io.BytesIO()
-                        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                            df_conf.to_excel(writer, sheet_name='신뢰도통계', index=False)
-                        excel_buffer.seek(0)
+                        df_conf_csv = pd.DataFrame(csv_conf)
                         st.download_button(
-                            label="📥 신뢰도 통계 Excel 다운로드",
-                            data=excel_buffer,
-                            file_name=f"confidence_stats_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            label="📥 신뢰도 통계 CSV 다운로드",
+                            data=df_conf_csv.to_csv(index=False, encoding="utf-8-sig"),
+                            file_name=f"confidence_stats_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                            mime="text/csv",
                             use_container_width=True
                         )
                     else:
                         st.info("신뢰도 데이터가 없습니다.")
-
-                # ========== 동일 이미지 비교 탭 ==========
-                with stat_tab3:
-                    st.subheader("🖼️ 동일 이미지 모델별 상세 비교")
-                    st.caption("같은 이미지를 여러 모델/해상도로 분석한 결과를 상세 비교합니다.")
-
-                    if image_comparisons:
-                        for comp_idx, comp in enumerate(image_comparisons[:20]):  # 최대 20개
-                            with st.expander(f"📄 {comp['filename']} ({comp['variant_count']}개 시행)", expanded=(comp_idx == 0)):
-                                # 썸네일
-                                if comp["thumbnail"]:
-                                    st.image(
-                                        f"data:image/png;base64,{comp['thumbnail']}",
-                                        caption=comp["filename"],
-                                        width=200
-                                    )
-
-                                st.divider()
-
-                                # 통합 비교 테이블 (행: 각 시행, 열: 상세 항목)
-                                st.markdown("**📊 시행별 상세 비교** (각 행 = 모델 시행)")
-
-                                comparison_rows = []
-                                for r in comp["results"]:
-                                    model_name = MODEL_OPTIONS.get(r["model"], {}).get("name", r["model"])
-                                    short_name = model_name.split(". ")[-1] if ". " in model_name else model_name
-
-                                    # 색상을 텍스트로 표시
-                                    colors_str = ", ".join(r["colors_dominant"][:3]) if r["colors_dominant"] else "-"
-
-                                    comparison_rows.append({
-                                        "모델": short_name,
-                                        "해상도": r["resolution"],
-                                        "카테고리": ", ".join(r["categories"][:3]) if r["categories"] else "-",
-                                        "신뢰도": f"{r['confidence']:.0%}" if r["confidence"] else "-",
-                                        "스타일": r["style_type"] or "-",
-                                        "시대": r["style_era"] or "-",
-                                        "기법": r["style_technique"] or "-",
-                                        "무드(주)": r["mood_primary"] or "-",
-                                        "무드(부)": ", ".join(r["mood_secondary"][:2]) if r["mood_secondary"] else "-",
-                                        "패턴크기": r["pattern_scale"] or "-",
-                                        "패턴반복": r["pattern_repeat"] or "-",
-                                        "패턴밀도": r["pattern_density"] or "-",
-                                        "색상": colors_str,
-                                        "팔레트": r["colors_palette"] or "-",
-                                        "키워드": ", ".join(r["keywords"][:5]) if r["keywords"] else "-",
-                                        "추천제품": ", ".join(r["usage_products"][:2]) if r["usage_products"] else "-",
-                                        "시즌": ", ".join(r["usage_season"]) if r["usage_season"] else "-",
-                                        "타겟": ", ".join(r["usage_target"][:2]) if r["usage_target"] else "-",
-                                        "비용($)": f"{r['cost_usd']:.5f}",
-                                        "시간(s)": f"{r['elapsed_time']:.2f}",
-                                    })
-
-                                df_comparison = pd.DataFrame(comparison_rows)
-                                st.dataframe(df_comparison, use_container_width=True, hide_index=True, height=min(600, 75 + len(comparison_rows) * 52))
-                    else:
-                        st.info("동일 이미지를 여러 모델로 분석한 데이터가 없습니다.\n모델 비교 테스트를 실행해주세요.")
 
             else:
                 st.info("분석 데이터가 없습니다. 먼저 이미지를 분석해주세요.")
@@ -1767,37 +1716,35 @@ def main():
         # 데이터 조회 탭
         # ============================================
         with subtab2:
-            st.subheader("📋 저장된 분석 결과")
+            # 필터 + 내보내기 통합 영역 (한 줄)
+            f_col1, f_col2, f_col3, f_col4, f_col5 = st.columns([1.5, 1, 1, 1, 1.5])
 
-            # 필터 옵션
-            filter_col1, filter_col2, filter_col3 = st.columns([1, 1, 2])
-
-            with filter_col1:
-                # 모델 필터
+            with f_col1:
                 model_options = ["전체"] + list(MODEL_OPTIONS.keys())
                 selected_model_filter = st.selectbox(
-                    "모델 필터",
+                    "모델",
                     options=model_options,
-                    format_func=lambda x: "전체" if x == "전체" else MODEL_OPTIONS.get(x, {}).get("name", x).split(". ")[-1]
+                    format_func=lambda x: "전체" if x == "전체" else MODEL_OPTIONS.get(x, {}).get("name", x).split(". ")[-1],
+                    label_visibility="collapsed"
                 )
 
-            with filter_col2:
-                # 해상도 필터
+            with f_col2:
                 resolution_options = ["전체", "low", "medium", "high"]
                 selected_resolution_filter = st.selectbox(
-                    "해상도 필터",
-                    options=resolution_options
+                    "해상도",
+                    options=resolution_options,
+                    label_visibility="collapsed"
                 )
 
-            with filter_col3:
-                # 성공/실패 필터
+            with f_col3:
                 success_options = ["전체", "성공만", "실패만"]
                 selected_success_filter = st.selectbox(
-                    "결과 필터",
-                    options=success_options
+                    "결과",
+                    options=success_options,
+                    label_visibility="collapsed"
                 )
 
-            # 필터 적용된 총 개수 조회
+            # 통계 계산
             filtered_count = get_filtered_count(
                 model_filter=selected_model_filter,
                 resolution_filter=selected_resolution_filter,
@@ -1806,19 +1753,20 @@ def main():
             db_stats = get_db_stats()
             total_count = db_stats["total_count"]
 
-            # 필터 상태 표시
-            if selected_model_filter != "전체" or selected_resolution_filter != "전체" or selected_success_filter != "전체":
-                st.info(f"🔍 필터 적용됨: {filtered_count}건 / 전체 {total_count}건")
+            is_filtered = selected_model_filter != "전체" or selected_resolution_filter != "전체" or selected_success_filter != "전체"
 
-            # Excel 내보내기 버튼
-            col_export1, col_export2 = st.columns([1, 3])
-            with col_export1:
-                if st.button("📥 전체 Excel 내보내기", use_container_width=True, disabled=total_count == 0):
-                    # 전체 데이터 조회
+            with f_col4:
+                if is_filtered:
+                    st.caption(f"🔍 {filtered_count}/{total_count}건")
+                else:
+                    st.caption(f"📊 총 {total_count}건")
+
+            with f_col5:
+                if st.button("📥 Excel", use_container_width=True, disabled=total_count == 0):
                     all_results = load_results_from_db(limit=10000, offset=0)
-
                     if all_results:
                         import pandas as pd
+                        from io import BytesIO
 
                         excel_rows = []
                         for r in all_results:
@@ -1833,8 +1781,6 @@ def main():
                                 "소요시간": r["elapsed_time"],
                                 "일시": r["created_at"],
                             }
-
-                            # 메타데이터 필드 추가
                             if r["success"] and r["metadata"]:
                                 m = r["metadata"]
                                 cat_matches = m.get("category", {}).get("matches", [])
@@ -1856,38 +1802,34 @@ def main():
                                 row["추천제품"] = ", ".join(m.get("usage_suggestion", {}).get("products", []))
                                 row["추천시즌"] = ", ".join(m.get("usage_suggestion", {}).get("season", []))
                                 row["타겟마켓"] = ", ".join(m.get("usage_suggestion", {}).get("target_market", []))
-
+                                row["추천원단"] = ", ".join(m.get("usage_suggestion", {}).get("fabrics", []))
                             excel_rows.append(row)
 
                         df = pd.DataFrame(excel_rows)
-                        excel_buffer = io.BytesIO()
-                        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                            df.to_excel(writer, sheet_name='전체분석결과', index=False)
-                        excel_buffer.seek(0)
+                        output = BytesIO()
+                        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                            df.to_excel(writer, index=False, sheet_name='분석결과')
+                        excel_data = output.getvalue()
 
                         st.download_button(
                             label=f"📄 다운로드 ({total_count}건)",
-                            data=excel_buffer,
+                            data=excel_data,
                             file_name=f"textile_analysis_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             use_container_width=True
                         )
 
-            with col_export2:
-                st.caption(f"총 {total_count}건의 분석 결과가 저장되어 있습니다.")
-
-            st.divider()
-
-            # 페이지네이션 설정
-            items_per_page = st.selectbox("페이지당 항목 수", [10, 20, 50], index=0)
+            # 페이지네이션 설정 (한 줄로 통합)
+            pg_col1, pg_col2 = st.columns([1, 5])
+            with pg_col1:
+                items_per_page = st.selectbox("항목수", [10, 20, 50], index=0, label_visibility="collapsed")
 
             # 필터 적용된 개수로 페이지네이션
-            display_count = filtered_count if (selected_model_filter != "전체" or selected_resolution_filter != "전체" or selected_success_filter != "전체") else total_count
+            display_count = filtered_count if is_filtered else total_count
 
             if display_count > 0:
                 total_pages = (display_count + items_per_page - 1) // items_per_page
 
-                # 페이지 선택
                 if "db_page" not in st.session_state:
                     st.session_state.db_page = 1
 
@@ -1899,21 +1841,22 @@ def main():
                     st.session_state.db_page = 1
                     st.session_state.last_filter_key = filter_key
 
-                # 페이지 범위 조정
                 if st.session_state.db_page > total_pages:
                     st.session_state.db_page = max(1, total_pages)
 
-                col1, col2, col3 = st.columns([1, 2, 1])
-                with col1:
-                    if st.button("◀ 이전", disabled=st.session_state.db_page <= 1):
-                        st.session_state.db_page -= 1
-                        st.rerun()
-                with col2:
-                    st.markdown(f"<center>페이지 {st.session_state.db_page} / {total_pages} (총 {display_count}건)</center>", unsafe_allow_html=True)
-                with col3:
-                    if st.button("다음 ▶", disabled=st.session_state.db_page >= total_pages):
-                        st.session_state.db_page += 1
-                        st.rerun()
+                # 페이지네이션 컨트롤 (pg_col2에 배치)
+                with pg_col2:
+                    nav_col1, nav_col2, nav_col3 = st.columns([1, 2, 1])
+                    with nav_col1:
+                        if st.button("◀", disabled=st.session_state.db_page <= 1, use_container_width=True):
+                            st.session_state.db_page -= 1
+                            st.rerun()
+                    with nav_col2:
+                        st.markdown(f"<center style='padding:8px;'>{st.session_state.db_page} / {total_pages}</center>", unsafe_allow_html=True)
+                    with nav_col3:
+                        if st.button("▶", disabled=st.session_state.db_page >= total_pages, use_container_width=True):
+                            st.session_state.db_page += 1
+                            st.rerun()
 
                 # 현재 페이지 데이터 조회 (필터 적용)
                 offset = (st.session_state.db_page - 1) * items_per_page
@@ -2089,12 +2032,15 @@ def main():
                                         products = usage.get("products", [])
                                         season = usage.get("season", [])
                                         target = usage.get("target_market", [])
+                                        fabrics = usage.get("fabrics", [])
                                         if products:
                                             st.write(f"추천 제품: {', '.join(products)}")
                                         if season:
                                             st.write(f"추천 시즌: {', '.join(season)}")
                                         if target:
                                             st.write(f"타겟 마켓: {', '.join(target)}")
+                                        if fabrics:
+                                            st.write(f"추천 원단: {', '.join(fabrics)}")
 
                                     # 분석 일시
                                     st.caption(f"📅 분석 일시: {r['created_at']}")
