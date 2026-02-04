@@ -14,10 +14,18 @@ import os
 import io
 import base64
 import time
-import sqlite3
+import hashlib
 from datetime import datetime
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from colorthief import ColorThief
+import boto3
+from botocore.exceptions import ClientError
+
+# SQLAlchemy ORM
+from sqlalchemy import create_engine, Column, Integer, String, Text, Boolean, Float, DateTime, JSON, func, distinct
+from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.pool import QueuePool
 
 # 환경변수 로드
 load_dotenv()
@@ -86,190 +94,279 @@ def logout():
 EXCHANGE_RATE = 1470  # ₩1,470/$1
 
 # ============================================
-# SQLite 데이터베이스 설정
+# SQLAlchemy ORM 설정 (MariaDB/MySQL - AWS RDS)
 # ============================================
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results.db")
+Base = declarative_base()
+
+class AnalysisResult(Base):
+    """분석 결과 ORM 모델"""
+    __tablename__ = 'analysis_results'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    filename = Column(String(500), nullable=False, index=True)
+    image_hash = Column(String(64), nullable=True, index=True)  # 이미지 해시 (중복 체크용)
+    image_url = Column(String(1000), nullable=True)  # S3 URL
+    model = Column(String(100), nullable=False, index=True)
+    resolution = Column(String(50), nullable=False)
+    success = Column(Boolean, nullable=False)
+    meta_data = Column('metadata', JSON, nullable=True)  # DB 컬럼명은 'metadata' 유지
+    cost_usd = Column(Float, nullable=True)
+    cost_krw = Column(Float, nullable=True)
+    elapsed_time = Column(Float, nullable=True)
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    def to_dict(self):
+        """딕셔너리 변환"""
+        return {
+            "id": self.id,
+            "filename": self.filename,
+            "image_hash": self.image_hash,
+            "image_url": self.image_url,
+            "model": self.model,
+            "resolution": self.resolution,
+            "success": self.success,
+            "metadata": self.meta_data,
+            "cost_usd": float(self.cost_usd) if self.cost_usd else 0,
+            "cost_krw": float(self.cost_krw) if self.cost_krw else 0,
+            "elapsed_time": float(self.elapsed_time) if self.elapsed_time else 0,
+            "error": self.error,
+            "created_at": self.created_at.isoformat() if self.created_at else None
+        }
+
+
+# ============================================
+# S3 이미지 저장 (중복 체크)
+# ============================================
+
+_s3_client = None
+
+def get_s3_client():
+    """S3 클라이언트 반환 (싱글톤)"""
+    global _s3_client
+    if _s3_client is None:
+        _s3_client = boto3.client(
+            's3',
+            aws_access_key_id=get_api_key("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=get_api_key("AWS_SECRET_ACCESS_KEY"),
+            region_name=get_api_key("AWS_REGION") or "ap-northeast-2"
+        )
+    return _s3_client
+
+
+def calculate_image_hash(image: Image.Image) -> str:
+    """이미지의 SHA256 해시 계산"""
+    img_buffer = io.BytesIO()
+    image.save(img_buffer, format="PNG")
+    img_bytes = img_buffer.getvalue()
+    return hashlib.sha256(img_bytes).hexdigest()
+
+
+def get_existing_image_url(image_hash: str) -> str | None:
+    """동일 해시의 이미지 URL이 이미 있는지 확인 -> 이미지 픽셀 해쉬화 해서 중복 조회"""
+    session = get_session()
+    try:
+        result = session.query(AnalysisResult.image_url).filter(
+            AnalysisResult.image_hash == image_hash,
+            AnalysisResult.image_url.isnot(None)
+        ).first()
+        return result.image_url if result else None
+    finally:
+        session.close()
+
+
+def upload_image_to_s3(image: Image.Image, filename: str, image_hash: str) -> str:
+    """
+    이미지를 S3에 업로드하고 URL 반환
+    - 동일 해시의 이미지가 이미 있으면 기존 URL 반환
+    """
+    # 이미 업로드된 이미지인지 확인
+    existing_url = get_existing_image_url(image_hash)
+    if existing_url:
+        return existing_url
+
+    # S3에 업로드
+    s3_client = get_s3_client()
+    bucket_name = get_api_key("S3_BUCKET_NAME")
+    storage_path = get_api_key("S3_STORAGE_PATH") or "tdb/storage/uploads"
+
+    # 파일 경로: {storage_path}/metadata-extractor/{hash[:8]}/{hash}.png
+    s3_key = f"{storage_path}/metadata-extractor/{image_hash[:8]}/{image_hash}.png"
+
+    # 이미지를 바이트로 변환
+    img_buffer = io.BytesIO()
+    image.save(img_buffer, format="PNG")
+    img_buffer.seek(0)
+
+    try:
+        s3_client.upload_fileobj(
+            img_buffer,
+            bucket_name,
+            s3_key,
+            ExtraArgs={
+                'ContentType': 'image/png',
+                'CacheControl': 'max-age=31536000'  # 1년 캐시
+            }
+        )
+        # S3 URL 생성
+        image_url = f"https://{bucket_name}.s3.{get_api_key('AWS_REGION') or 'ap-northeast-2'}.amazonaws.com/{s3_key}"
+        return image_url
+
+    except ClientError as e:
+        raise Exception(f"S3 업로드 실패: {e}")
+
+
+# 데이터베이스 엔진 및 세션 (싱글톤)
+_engine = None
+_SessionLocal = None
+
+def get_database_url() -> str:
+    """DATABASE_URL 가져오기 (mysql → mysql+pymysql 변환)"""
+    database_url = get_api_key("DATABASE_URL")
+    if not database_url:
+        raise ValueError("DATABASE_URL 환경변수가 설정되지 않았습니다.")
+
+    # SQLAlchemy용 드라이버 지정
+    if database_url.startswith("mysql://"):
+        database_url = database_url.replace("mysql://", "mysql+pymysql://", 1)
+
+    return database_url
+
+def get_engine():
+    """SQLAlchemy 엔진 반환 (싱글톤)"""
+    global _engine
+    if _engine is None:
+        _engine = create_engine(
+            get_database_url(),
+            poolclass=QueuePool,
+            pool_size=5,
+            max_overflow=10,
+            pool_recycle=3600,
+            echo=False
+        )
+    return _engine
+
+def get_session():
+    """SQLAlchemy 세션 반환"""
+    global _SessionLocal
+    if _SessionLocal is None:
+        _SessionLocal = sessionmaker(bind=get_engine())
+    return _SessionLocal()
 
 def init_db():
     """데이터베이스 초기화 및 테이블 생성"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS analysis_results (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            filename TEXT NOT NULL,
-            model TEXT NOT NULL,
-            resolution TEXT NOT NULL,
-            success INTEGER NOT NULL,
-            metadata JSON,
-            cost_usd REAL,
-            cost_krw REAL,
-            elapsed_time REAL,
-            error TEXT,
-            image_data TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # 기존 테이블에 image_data 컬럼이 없으면 추가
-    cursor.execute("PRAGMA table_info(analysis_results)")
-    columns = [col[1] for col in cursor.fetchall()]
-    if "image_data" not in columns:
-        cursor.execute("ALTER TABLE analysis_results ADD COLUMN image_data TEXT")
-
-    conn.commit()
-    conn.close()
+    engine = get_engine()
+    Base.metadata.create_all(engine)
 
 def save_result_to_db(result_data: dict):
-    """분석 결과를 DB에 저장"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    """분석 결과를 DB에 저장 (이미지는 S3에 업로드)"""
+    session = get_session()
+    try:
+        image_hash = None
+        image_url = None
 
-    # 이미지를 base64로 인코딩
-    image_data = None
-    if "image" in result_data and result_data["image"] is not None:
-        image_data = image_to_base64(result_data["image"])
+        # 이미지를 S3에 업로드 (중복 체크)
+        if "image" in result_data and result_data["image"] is not None:
+            image = result_data["image"]
+            image_hash = calculate_image_hash(image)
+            image_url = upload_image_to_s3(image, result_data.get("filename", "unknown"), image_hash)
 
-    cursor.execute("""
-        INSERT INTO analysis_results
-        (filename, model, resolution, success, metadata, cost_usd, cost_krw, elapsed_time, error, image_data)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        result_data.get("filename"),
-        result_data.get("model"),
-        result_data.get("resolution"),
-        1 if result_data.get("result", {}).get("success") else 0,
-        json.dumps(result_data.get("result", {}).get("metadata")) if result_data.get("result", {}).get("success") else None,
-        result_data.get("result", {}).get("cost", {}).get("total", 0),
-        result_data.get("result", {}).get("cost", {}).get("krw", 0),
-        result_data.get("result", {}).get("elapsed_time", 0),
-        result_data.get("result", {}).get("error"),
-        image_data
-    ))
-
-    conn.commit()
-    conn.close()
+        result = AnalysisResult(
+            filename=result_data.get("filename"),
+            image_hash=image_hash,
+            image_url=image_url,
+            model=result_data.get("model"),
+            resolution=result_data.get("resolution"),
+            success=result_data.get("result", {}).get("success", False),
+            meta_data=result_data.get("result", {}).get("metadata") if result_data.get("result", {}).get("success") else None,
+            cost_usd=result_data.get("result", {}).get("cost", {}).get("total", 0),
+            cost_krw=result_data.get("result", {}).get("cost", {}).get("krw", 0),
+            elapsed_time=result_data.get("result", {}).get("elapsed_time", 0),
+            error=result_data.get("result", {}).get("error"),
+        )
+        session.add(result)
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        raise e
+    finally:
+        session.close()
 
 def load_results_from_db(limit: int = 100, offset: int = 0, model_filter: str = None, resolution_filter: str = None, success_filter: str = None):
     """DB에서 분석 결과 불러오기 (페이지네이션 + 필터 지원)"""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
+    session = get_session()
+    try:
+        query = session.query(AnalysisResult)
 
-    # 동적 WHERE 절 구성
-    conditions = []
-    params = []
+        # 필터 적용
+        if model_filter and model_filter != "전체":
+            query = query.filter(AnalysisResult.model == model_filter)
 
-    if model_filter and model_filter != "전체":
-        conditions.append("model = ?")
-        params.append(model_filter)
+        if resolution_filter and resolution_filter != "전체":
+            query = query.filter(AnalysisResult.resolution == resolution_filter)
 
-    if resolution_filter and resolution_filter != "전체":
-        conditions.append("resolution = ?")
-        params.append(resolution_filter)
+        if success_filter == "성공만":
+            query = query.filter(AnalysisResult.success == True)
+        elif success_filter == "실패만":
+            query = query.filter(AnalysisResult.success == False)
 
-    if success_filter == "성공만":
-        conditions.append("success = 1")
-    elif success_filter == "실패만":
-        conditions.append("success = 0")
+        # 정렬 및 페이지네이션
+        results = query.order_by(AnalysisResult.id.desc()).offset(offset).limit(limit).all()
 
-    where_clause = ""
-    if conditions:
-        where_clause = "WHERE " + " AND ".join(conditions)
-
-    query = f"""
-        SELECT * FROM analysis_results
-        {where_clause}
-        ORDER BY id DESC
-        LIMIT ? OFFSET ?
-    """
-    params.extend([limit, offset])
-
-    cursor.execute(query, params)
-
-    rows = cursor.fetchall()
-    conn.close()
-
-    results = []
-    for row in rows:
-        results.append({
-            "id": row["id"],
-            "filename": row["filename"],
-            "model": row["model"],
-            "resolution": row["resolution"],
-            "success": bool(row["success"]),
-            "metadata": json.loads(row["metadata"]) if row["metadata"] else None,
-            "cost_usd": row["cost_usd"],
-            "cost_krw": row["cost_krw"],
-            "elapsed_time": row["elapsed_time"],
-            "error": row["error"],
-            "image_data": row["image_data"] if "image_data" in row.keys() else None,
-            "created_at": row["created_at"]
-        })
-
-    return results
+        return [r.to_dict() for r in results]
+    finally:
+        session.close()
 
 
 def get_filtered_count(model_filter: str = None, resolution_filter: str = None, success_filter: str = None) -> int:
     """필터 적용된 결과 개수 조회"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    session = get_session()
+    try:
+        query = session.query(func.count(AnalysisResult.id))
 
-    conditions = []
-    params = []
+        if model_filter and model_filter != "전체":
+            query = query.filter(AnalysisResult.model == model_filter)
 
-    if model_filter and model_filter != "전체":
-        conditions.append("model = ?")
-        params.append(model_filter)
+        if resolution_filter and resolution_filter != "전체":
+            query = query.filter(AnalysisResult.resolution == resolution_filter)
 
-    if resolution_filter and resolution_filter != "전체":
-        conditions.append("resolution = ?")
-        params.append(resolution_filter)
+        if success_filter == "성공만":
+            query = query.filter(AnalysisResult.success == True)
+        elif success_filter == "실패만":
+            query = query.filter(AnalysisResult.success == False)
 
-    if success_filter == "성공만":
-        conditions.append("success = 1")
-    elif success_filter == "실패만":
-        conditions.append("success = 0")
-
-    where_clause = ""
-    if conditions:
-        where_clause = "WHERE " + " AND ".join(conditions)
-
-    cursor.execute(f"SELECT COUNT(*) FROM analysis_results {where_clause}", params)
-    count = cursor.fetchone()[0]
-    conn.close()
-
-    return count
+        return query.scalar()
+    finally:
+        session.close()
 
 def get_db_stats():
     """DB 통계 조회"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    session = get_session()
+    try:
+        total_count = session.query(func.count(AnalysisResult.id)).scalar()
 
-    cursor.execute("SELECT COUNT(*) FROM analysis_results")
-    total_count = cursor.fetchone()[0]
+        total_cost = session.query(func.coalesce(func.sum(AnalysisResult.cost_usd), 0)).filter(
+            AnalysisResult.success == True
+        ).scalar()
+        total_cost = float(total_cost) if total_cost else 0
 
-    cursor.execute("SELECT SUM(cost_usd) FROM analysis_results WHERE success = 1")
-    total_cost = cursor.fetchone()[0] or 0
+        model_stats_query = session.query(
+            AnalysisResult.model,
+            func.count(AnalysisResult.id),
+            func.sum(AnalysisResult.cost_usd)
+        ).filter(AnalysisResult.success == True).group_by(AnalysisResult.model).all()
 
-    cursor.execute("""
-        SELECT model, COUNT(*) as count, SUM(cost_usd) as cost
-        FROM analysis_results
-        WHERE success = 1
-        GROUP BY model
-    """)
-    model_stats = cursor.fetchall()
+        model_stats = [(row[0], row[1], float(row[2]) if row[2] else 0) for row in model_stats_query]
 
-    conn.close()
-
-    return {
-        "total_count": total_count,
-        "total_cost_usd": total_cost,
-        "total_cost_krw": total_cost * EXCHANGE_RATE,
-        "model_stats": model_stats
-    }
+        return {
+            "total_count": total_count,
+            "total_cost_usd": total_cost,
+            "total_cost_krw": total_cost * EXCHANGE_RATE,
+            "model_stats": model_stats
+        }
+    finally:
+        session.close()
 
 
 def delete_results_from_db(ids: list) -> int:
@@ -277,344 +374,350 @@ def delete_results_from_db(ids: list) -> int:
     if not ids:
         return 0
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    placeholders = ",".join(["?" for _ in ids])
-    cursor.execute(f"DELETE FROM analysis_results WHERE id IN ({placeholders})", ids)
-
-    deleted_count = cursor.rowcount
-    conn.commit()
-    conn.close()
-
-    return deleted_count
+    session = get_session()
+    try:
+        deleted_count = session.query(AnalysisResult).filter(
+            AnalysisResult.id.in_(ids)
+        ).delete(synchronize_session=False)
+        session.commit()
+        return deleted_count
+    except Exception as e:
+        session.rollback()
+        raise e
+    finally:
+        session.close()
 
 
 def get_model_comparison_stats():
     """모델별 상세 비교 통계 조회 (수치형 데이터)"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    session = get_session()
+    try:
+        from sqlalchemy import case
 
-    # 기본 통계 + 상세 통계
-    cursor.execute("""
-        SELECT
-            model,
-            resolution,
-            COUNT(*) as total_count,
-            SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as success_count,
-            AVG(CASE WHEN success = 1 THEN cost_usd ELSE NULL END) as avg_cost,
-            MIN(CASE WHEN success = 1 THEN cost_usd ELSE NULL END) as min_cost,
-            MAX(CASE WHEN success = 1 THEN cost_usd ELSE NULL END) as max_cost,
-            AVG(CASE WHEN success = 1 THEN elapsed_time ELSE NULL END) as avg_time,
-            MIN(CASE WHEN success = 1 THEN elapsed_time ELSE NULL END) as min_time,
-            MAX(CASE WHEN success = 1 THEN elapsed_time ELSE NULL END) as max_time,
-            SUM(CASE WHEN success = 1 THEN cost_usd ELSE 0 END) as total_cost
-        FROM analysis_results
-        GROUP BY model, resolution
-        ORDER BY model, resolution
-    """)
+        # 기본 통계 쿼리
+        query = session.query(
+            AnalysisResult.model,
+            AnalysisResult.resolution,
+            func.count(AnalysisResult.id).label('total_count'),
+            func.sum(case((AnalysisResult.success == True, 1), else_=0)).label('success_count'),
+            func.avg(case((AnalysisResult.success == True, AnalysisResult.cost_usd), else_=None)).label('avg_cost'),
+            func.min(case((AnalysisResult.success == True, AnalysisResult.cost_usd), else_=None)).label('min_cost'),
+            func.max(case((AnalysisResult.success == True, AnalysisResult.cost_usd), else_=None)).label('max_cost'),
+            func.avg(case((AnalysisResult.success == True, AnalysisResult.elapsed_time), else_=None)).label('avg_time'),
+            func.min(case((AnalysisResult.success == True, AnalysisResult.elapsed_time), else_=None)).label('min_time'),
+            func.max(case((AnalysisResult.success == True, AnalysisResult.elapsed_time), else_=None)).label('max_time'),
+            func.sum(case((AnalysisResult.success == True, AnalysisResult.cost_usd), else_=0)).label('total_cost')
+        ).group_by(AnalysisResult.model, AnalysisResult.resolution).order_by(
+            AnalysisResult.model, AnalysisResult.resolution
+        )
 
-    rows = cursor.fetchall()
+        rows = query.all()
 
-    # 표준편차 계산을 위한 추가 쿼리
-    stats = []
-    for row in rows:
-        model, resolution, total, success, avg_cost, min_cost, max_cost, avg_time, min_time, max_time, total_cost = row
+        stats = []
+        for row in rows:
+            model = row.model
+            resolution = row.resolution
+            total = row.total_count
+            success = row.success_count or 0
+            avg_cost = float(row.avg_cost) if row.avg_cost else 0
+            min_cost = float(row.min_cost) if row.min_cost else 0
+            max_cost = float(row.max_cost) if row.max_cost else 0
+            avg_time = float(row.avg_time) if row.avg_time else 0
+            min_time = float(row.min_time) if row.min_time else 0
+            max_time = float(row.max_time) if row.max_time else 0
+            total_cost = float(row.total_cost) if row.total_cost else 0
 
-        # 표준편차 계산
-        cursor.execute("""
-            SELECT
-                AVG((elapsed_time - ?) * (elapsed_time - ?)) as time_variance,
-                AVG((cost_usd - ?) * (cost_usd - ?)) as cost_variance
-            FROM analysis_results
-            WHERE model = ? AND resolution = ? AND success = 1
-        """, (avg_time or 0, avg_time or 0, avg_cost or 0, avg_cost or 0, model, resolution))
+            # 표준편차 계산
+            variance_query = session.query(
+                func.avg(func.pow(AnalysisResult.elapsed_time - avg_time, 2)).label('time_variance'),
+                func.avg(func.pow(AnalysisResult.cost_usd - avg_cost, 2)).label('cost_variance')
+            ).filter(
+                AnalysisResult.model == model,
+                AnalysisResult.resolution == resolution,
+                AnalysisResult.success == True
+            ).first()
 
-        variance_row = cursor.fetchone()
-        time_stddev = (variance_row[0] ** 0.5) if variance_row[0] else 0
-        cost_stddev = (variance_row[1] ** 0.5) if variance_row[1] else 0
+            time_stddev = (float(variance_query.time_variance) ** 0.5) if variance_query.time_variance else 0
+            cost_stddev = (float(variance_query.cost_variance) ** 0.5) if variance_query.cost_variance else 0
 
-        success_rate = (success / total * 100) if total > 0 else 0
-        fail_count = total - success
+            success_rate = (success / total * 100) if total > 0 else 0
+            fail_count = total - success
 
-        stats.append({
-            "model": model,
-            "resolution": resolution,
-            "total_count": total,
-            "success_count": success,
-            "fail_count": fail_count,
-            "success_rate": success_rate,
-            # 비용 통계
-            "avg_cost_usd": avg_cost or 0,
-            "avg_cost_krw": (avg_cost or 0) * EXCHANGE_RATE,
-            "min_cost_usd": min_cost or 0,
-            "max_cost_usd": max_cost or 0,
-            "cost_stddev": cost_stddev,
-            "total_cost_usd": total_cost or 0,
-            # 시간 통계
-            "avg_time": avg_time or 0,
-            "min_time": min_time or 0,
-            "max_time": max_time or 0,
-            "time_stddev": time_stddev,
-            # 예상 비용
-            "cost_per_1200": (avg_cost or 0) * 1200 * EXCHANGE_RATE,
-            "cost_per_10000": (avg_cost or 0) * 10000 * EXCHANGE_RATE,
-            "cost_per_100000": (avg_cost or 0) * 100000 * EXCHANGE_RATE,
-        })
+            stats.append({
+                "model": model,
+                "resolution": resolution,
+                "total_count": total,
+                "success_count": success,
+                "fail_count": fail_count,
+                "success_rate": success_rate,
+                # 비용 통계
+                "avg_cost_usd": avg_cost,
+                "avg_cost_krw": avg_cost * EXCHANGE_RATE,
+                "min_cost_usd": min_cost,
+                "max_cost_usd": max_cost,
+                "cost_stddev": cost_stddev,
+                "total_cost_usd": total_cost,
+                # 시간 통계
+                "avg_time": avg_time,
+                "min_time": min_time,
+                "max_time": max_time,
+                "time_stddev": time_stddev,
+                # 예상 비용
+                "cost_per_1200": avg_cost * 1200 * EXCHANGE_RATE,
+                "cost_per_10000": avg_cost * 10000 * EXCHANGE_RATE,
+                "cost_per_100000": avg_cost * 100000 * EXCHANGE_RATE,
+            })
 
-    conn.close()
-    return stats
+        return stats
+    finally:
+        session.close()
 
 
 def get_model_categorical_stats():
     """모델별 카테고리 데이터 집계 (빈도 기반)"""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
+    session = get_session()
+    try:
+        # 모든 성공한 분석 결과 조회
+        results = session.query(
+            AnalysisResult.model,
+            AnalysisResult.resolution,
+            AnalysisResult.meta_data
+        ).filter(AnalysisResult.success == True).order_by(
+            AnalysisResult.model, AnalysisResult.resolution
+        ).all()
 
-    # 모든 성공한 분석 결과 조회
-    cursor.execute("""
-        SELECT model, resolution, metadata
-        FROM analysis_results
-        WHERE success = 1
-        ORDER BY model, resolution
-    """)
+        from collections import Counter
 
-    results = cursor.fetchall()
-    conn.close()
-
-    from collections import Counter
-
-    # 모델+해상도별 집계
-    model_stats = {}
-
-    for r in results:
-        key = f"{r['model']}|{r['resolution']}"
-        if key not in model_stats:
-            model_stats[key] = {
-                "model": r["model"],
-                "resolution": r["resolution"],
-                "count": 0,
-                "categories": [],
-                "colors": [],
-                "palettes": [],
-                "styles": [],
-                "moods": [],
-                "keywords": [],
-            }
-
-        model_stats[key]["count"] += 1
-
-        meta = json.loads(r["metadata"]) if r["metadata"] else {}
-        cat_data = meta.get("category", {})
-        colors_data = meta.get("colors", {})
-        keywords_data = meta.get("keywords", {})
-        style_data = meta.get("style", {})
-        mood_data = meta.get("mood", {})
-
-        # 카테고리 수집
-        categories = cat_data.get("matches", [])
-        model_stats[key]["categories"].extend(categories)
-
-        # 색상 수집
-        colors = colors_data.get("dominant", [])
-        model_stats[key]["colors"].extend(colors)
-
-        # 팔레트 수집
-        palette = colors_data.get("palette_name", "")
-        if palette:
-            model_stats[key]["palettes"].append(palette)
-
-        # 스타일 수집
-        style = style_data.get("type", "")
-        if style:
-            model_stats[key]["styles"].append(style)
-
-        # 무드 수집
-        mood = mood_data.get("primary", "")
-        if mood:
-            model_stats[key]["moods"].append(mood)
-
-        # 키워드 수집
-        keywords = keywords_data.get("search_tags", [])
-        model_stats[key]["keywords"].extend(keywords)
-
-    # 빈도 계산
-    aggregated = []
-    for key, stats in model_stats.items():
-        cat_counter = Counter(stats["categories"])
-        color_counter = Counter(stats["colors"])
-        palette_counter = Counter(stats["palettes"])
-        style_counter = Counter(stats["styles"])
-        mood_counter = Counter(stats["moods"])
-        keyword_counter = Counter(stats["keywords"])
-
-        aggregated.append({
-            "model": stats["model"],
-            "resolution": stats["resolution"],
-            "분석수": stats["count"],
-            # Top N 빈도
-            "top_categories": cat_counter.most_common(5),
-            "top_colors": color_counter.most_common(5),
-            "top_palettes": palette_counter.most_common(3),
-            "top_styles": style_counter.most_common(3),
-            "top_moods": mood_counter.most_common(3),
-            "top_keywords": keyword_counter.most_common(10),
-            # 고유값 수
-            "unique_categories": len(cat_counter),
-            "unique_colors": len(color_counter),
-            "unique_keywords": len(keyword_counter),
-        })
-
-    return aggregated
-
-
-def get_same_image_comparison():
-    """동일 이미지에 대한 모델별 상세 비교 데이터 (썸네일 포함)"""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-
-    # 여러 모델로 분석된 파일명 찾기
-    cursor.execute("""
-        SELECT filename, COUNT(DISTINCT model || '_' || resolution) as variant_count
-        FROM analysis_results
-        WHERE success = 1
-        GROUP BY filename
-        HAVING variant_count > 1
-        ORDER BY variant_count DESC
-    """)
-
-    multi_model_files = cursor.fetchall()
-
-    comparisons = []
-    for file_row in multi_model_files:
-        filename = file_row["filename"]
-
-        # 해당 파일의 모든 분석 결과 (이미지 데이터 포함)
-        cursor.execute("""
-            SELECT model, resolution, metadata, cost_usd, elapsed_time, image_data
-            FROM analysis_results
-            WHERE filename = ? AND success = 1
-            ORDER BY model, resolution
-        """, (filename,))
-
-        results = cursor.fetchall()
-
-        # 첫 번째 결과에서 썸네일 이미지 가져오기
-        thumbnail = None
-        for r in results:
-            if r["image_data"]:
-                thumbnail = r["image_data"]
-                break
-
-        file_comparison = {
-            "filename": filename,
-            "thumbnail": thumbnail,
-            "variant_count": file_row["variant_count"],
-            "results": []
-        }
+        # 모델+해상도별 집계
+        model_stats = {}
 
         for r in results:
-            meta = json.loads(r["metadata"]) if r["metadata"] else {}
+            key = f"{r.model}|{r.resolution}"
+            if key not in model_stats:
+                model_stats[key] = {
+                    "model": r.model,
+                    "resolution": r.resolution,
+                    "count": 0,
+                    "categories": [],
+                    "colors": [],
+                    "palettes": [],
+                    "styles": [],
+                    "moods": [],
+                    "keywords": [],
+                }
+
+            model_stats[key]["count"] += 1
+
+            meta = r.meta_data if r.meta_data else {}
+
             cat_data = meta.get("category", {})
             colors_data = meta.get("colors", {})
             keywords_data = meta.get("keywords", {})
             style_data = meta.get("style", {})
             mood_data = meta.get("mood", {})
-            pattern_data = meta.get("pattern", {})
-            usage_data = meta.get("usage_suggestion", {})
 
-            file_comparison["results"].append({
-                "model": r["model"],
-                "resolution": r["resolution"],
-                "cost_usd": r["cost_usd"],
-                "elapsed_time": r["elapsed_time"],
-                # 카테고리
-                "categories": cat_data.get("matches", []),
-                "confidence": cat_data.get("confidence"),
-                # 스타일
-                "style_type": style_data.get("type", ""),
-                "style_era": style_data.get("era", ""),
-                "style_technique": style_data.get("technique", ""),
-                # 무드
-                "mood_primary": mood_data.get("primary", ""),
-                "mood_secondary": mood_data.get("secondary", []),
-                # 패턴
-                "pattern_scale": pattern_data.get("scale", ""),
-                "pattern_repeat": pattern_data.get("repeat_type", ""),
-                "pattern_density": pattern_data.get("density", ""),
-                # 색상
-                "colors_dominant": colors_data.get("dominant", []),
-                "colors_palette": colors_data.get("palette_name", ""),
-                "colors_mood": colors_data.get("mood", ""),
-                # 키워드
-                "keywords": keywords_data.get("search_tags", []),
-                "description": keywords_data.get("description", ""),
-                # 활용 제안
-                "usage_products": usage_data.get("products", []),
-                "usage_season": usage_data.get("season", []),
-                "usage_target": usage_data.get("target_market", []),
-                "usage_fabrics": usage_data.get("fabrics", []),
+            # 카테고리 수집
+            categories = cat_data.get("matches", [])
+            model_stats[key]["categories"].extend(categories)
+
+            # 색상 수집
+            colors = colors_data.get("dominant", [])
+            model_stats[key]["colors"].extend(colors)
+
+            # 팔레트 수집
+            palette = colors_data.get("palette_name", "")
+            if palette:
+                model_stats[key]["palettes"].append(palette)
+
+            # 스타일 수집
+            style = style_data.get("type", "")
+            if style:
+                model_stats[key]["styles"].append(style)
+
+            # 무드 수집
+            mood = mood_data.get("primary", "")
+            if mood:
+                model_stats[key]["moods"].append(mood)
+
+            # 키워드 수집
+            keywords = keywords_data.get("search_tags", [])
+            model_stats[key]["keywords"].extend(keywords)
+
+        # 빈도 계산
+        aggregated = []
+        for key, stats in model_stats.items():
+            cat_counter = Counter(stats["categories"])
+            color_counter = Counter(stats["colors"])
+            palette_counter = Counter(stats["palettes"])
+            style_counter = Counter(stats["styles"])
+            mood_counter = Counter(stats["moods"])
+            keyword_counter = Counter(stats["keywords"])
+
+            aggregated.append({
+                "model": stats["model"],
+                "resolution": stats["resolution"],
+                "분석수": stats["count"],
+                # Top N 빈도
+                "top_categories": cat_counter.most_common(5),
+                "top_colors": color_counter.most_common(5),
+                "top_palettes": palette_counter.most_common(3),
+                "top_styles": style_counter.most_common(3),
+                "top_moods": mood_counter.most_common(3),
+                "top_keywords": keyword_counter.most_common(10),
+                # 고유값 수
+                "unique_categories": len(cat_counter),
+                "unique_colors": len(color_counter),
+                "unique_keywords": len(keyword_counter),
             })
 
-        comparisons.append(file_comparison)
+        return aggregated
+    finally:
+        session.close()
 
-    conn.close()
-    return comparisons
+
+def get_same_image_comparison():
+    """동일 이미지에 대한 모델별 상세 비교 데이터 (썸네일 포함)"""
+    session = get_session()
+    try:
+        # 여러 모델로 분석된 파일명 찾기
+        from sqlalchemy import distinct, literal_column
+
+        subquery = session.query(
+            AnalysisResult.filename,
+            func.count(distinct(func.concat(AnalysisResult.model, '_', AnalysisResult.resolution))).label('variant_count')
+        ).filter(AnalysisResult.success == True).group_by(AnalysisResult.filename).having(
+            func.count(distinct(func.concat(AnalysisResult.model, '_', AnalysisResult.resolution))) > 1
+        ).order_by(func.count(distinct(func.concat(AnalysisResult.model, '_', AnalysisResult.resolution))).desc()).all()
+
+        comparisons = []
+        for file_row in subquery:
+            filename = file_row.filename
+
+            # 해당 파일의 모든 분석 결과
+            results = session.query(AnalysisResult).filter(
+                AnalysisResult.filename == filename,
+                AnalysisResult.success == True
+            ).order_by(AnalysisResult.model, AnalysisResult.resolution).all()
+
+            # 첫 번째 결과에서 썸네일 이미지 가져오기
+            thumbnail = None
+            for r in results:
+                if r.image_url:
+                    thumbnail = r.image_url
+                    break
+
+            file_comparison = {
+                "filename": filename,
+                "thumbnail": thumbnail,
+                "variant_count": file_row.variant_count,
+                "results": []
+            }
+
+            for r in results:
+                meta = r.meta_data if r.meta_data else {}
+
+                cat_data = meta.get("category", {})
+                colors_data = meta.get("colors", {})
+                keywords_data = meta.get("keywords", {})
+                style_data = meta.get("style", {})
+                mood_data = meta.get("mood", {})
+                pattern_data = meta.get("pattern", {})
+                usage_data = meta.get("usage_suggestion", {})
+
+                file_comparison["results"].append({
+                    "model": r.model,
+                    "resolution": r.resolution,
+                    "cost_usd": float(r.cost_usd) if r.cost_usd else 0,
+                    "elapsed_time": float(r.elapsed_time) if r.elapsed_time else 0,
+                    # 카테고리
+                    "categories": cat_data.get("matches", []),
+                    "confidence": cat_data.get("confidence"),
+                    # 스타일
+                    "style_type": style_data.get("type", ""),
+                    "style_era": style_data.get("era", ""),
+                    "style_technique": style_data.get("technique", ""),
+                    # 무드
+                    "mood_primary": mood_data.get("primary", ""),
+                    "mood_secondary": mood_data.get("secondary", []),
+                    # 패턴
+                    "pattern_scale": pattern_data.get("scale", ""),
+                    "pattern_repeat": pattern_data.get("repeat_type", ""),
+                    "pattern_density": pattern_data.get("density", ""),
+                    # 색상
+                    "colors_dominant": colors_data.get("dominant", []),
+                    "colors_palette": colors_data.get("palette_name", ""),
+                    "colors_mood": colors_data.get("mood", ""),
+                    # 키워드
+                    "keywords": keywords_data.get("search_tags", []),
+                    "description": keywords_data.get("description", ""),
+                    # 활용 제안
+                    "usage_products": usage_data.get("products", []),
+                    "usage_season": usage_data.get("season", []),
+                    "usage_target": usage_data.get("target_market", []),
+                    "usage_fabrics": usage_data.get("fabrics", []),
+                })
+
+            comparisons.append(file_comparison)
+
+        return comparisons
+    finally:
+        session.close()
 
 
 def get_confidence_stats():
     """모델별 신뢰도(confidence) 통계"""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
+    session = get_session()
+    try:
+        results = session.query(
+            AnalysisResult.model,
+            AnalysisResult.resolution,
+            AnalysisResult.meta_data
+        ).filter(
+            AnalysisResult.success == True,
+            AnalysisResult.meta_data.isnot(None)
+        ).all()
 
-    cursor.execute("""
-        SELECT model, resolution, metadata
-        FROM analysis_results
-        WHERE success = 1 AND metadata IS NOT NULL
-    """)
+        # 모델/해상도별 신뢰도 수집
+        confidence_data = {}
+        for row in results:
+            key = (row.model, row.resolution)
+            if key not in confidence_data:
+                confidence_data[key] = []
 
-    rows = cursor.fetchall()
-    conn.close()
+            meta = row.meta_data if row.meta_data else {}
+            conf = meta.get("category", {}).get("confidence")
+            if conf is not None:
+                confidence_data[key].append(float(conf))
 
-    # 모델/해상도별 신뢰도 수집
-    confidence_data = {}
-    for row in rows:
-        key = (row["model"], row["resolution"])
-        if key not in confidence_data:
-            confidence_data[key] = []
+        # 통계 계산
+        stats = []
+        for (model, resolution), confidences in confidence_data.items():
+            if confidences:
+                avg_conf = sum(confidences) / len(confidences)
+                min_conf = min(confidences)
+                max_conf = max(confidences)
+                variance = sum((c - avg_conf) ** 2 for c in confidences) / len(confidences)
+                stddev = variance ** 0.5
 
-        meta = json.loads(row["metadata"]) if row["metadata"] else {}
-        conf = meta.get("category", {}).get("confidence")
-        if conf is not None:
-            confidence_data[key].append(conf)
+                stats.append({
+                    "model": model,
+                    "resolution": resolution,
+                    "count": len(confidences),
+                    "avg_confidence": avg_conf,
+                    "min_confidence": min_conf,
+                    "max_confidence": max_conf,
+                    "stddev_confidence": stddev,
+                })
 
-    # 통계 계산
-    stats = []
-    for (model, resolution), confidences in confidence_data.items():
-        if confidences:
-            avg_conf = sum(confidences) / len(confidences)
-            min_conf = min(confidences)
-            max_conf = max(confidences)
-            variance = sum((c - avg_conf) ** 2 for c in confidences) / len(confidences)
-            stddev = variance ** 0.5
+        return stats
+    finally:
+        session.close()
 
-            stats.append({
-                "model": model,
-                "resolution": resolution,
-                "count": len(confidences),
-                "avg_confidence": avg_conf,
-                "min_confidence": min_conf,
-                "max_confidence": max_conf,
-                "stddev_confidence": stddev,
-            })
-
-    return stats
-
-# DB 초기화
-init_db()
+# DB 초기화 (MySQL 연결 실패 시 재시도)
+try:
+    init_db()
+except Exception as e:
+    print(f"⚠️ DB 초기화 실패: {e}")
 
 # ============================================
 # 모델 설정 (Gemini 모델만 사용)
@@ -706,7 +809,7 @@ ANALYSIS_PROMPT = f"""Analyze this textile/pattern design image and provide meta
     "dominant": ["#hex1", "#hex2", "#hex3"],
     "palette_name": "descriptive name",
     "mood": "warm/cool/neutral/vibrant/muted"
-  }},
+  }},ㄴ
   "style": {{
     "type": "style name",
     "era": "time period if applicable",
@@ -762,19 +865,164 @@ def preprocess_image(image: Image.Image, max_size: int = 512) -> Image.Image:
 
 
 # ============================================
+# 색상 추출 함수 (Python 패키지 사용)
+# ============================================
+
+def rgb_to_hex(rgb: tuple) -> str:
+    """RGB 튜플을 HEX 문자열로 변환"""
+    return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
+
+
+def extract_colors_from_image(image: Image.Image, color_count: int = 5) -> dict:
+    """
+    ColorThief를 사용하여 이미지에서 주요 색상 추출
+
+    Args:
+        image: PIL Image 객체
+        color_count: 추출할 색상 수 (기본값: 5)
+
+    Returns:
+        dict: {
+            "dominant": ["#hex1", "#hex2", ...],
+            "palette_name": "자동 생성된 팔레트명",
+            "mood": "warm/cool/neutral/vibrant/muted"
+        }
+    """
+    try:
+        # PIL Image를 BytesIO로 변환 (ColorThief는 파일 객체 필요)
+        img_buffer = io.BytesIO()
+        image.save(img_buffer, format="PNG")
+        img_buffer.seek(0)
+
+        # ColorThief로 색상 추출
+        color_thief = ColorThief(img_buffer)
+
+        # 주요 색상 팔레트 추출
+        palette = color_thief.get_palette(color_count=color_count, quality=10)
+
+        # RGB를 HEX로 변환
+        hex_colors = [rgb_to_hex(color) for color in palette]
+
+        # 색상 분석하여 mood 결정
+        mood = _analyze_color_mood(palette)
+
+        # 팔레트 이름 생성
+        palette_name = _generate_palette_name(palette)
+
+        return {
+            "dominant": hex_colors,
+            "palette_name": palette_name,
+            "mood": mood
+        }
+
+    except Exception as e:
+        # 색상 추출 실패 시 기본값 반환
+        return {
+            "dominant": [],
+            "palette_name": "Unknown",
+            "mood": "neutral",
+            "error": str(e)
+        }
+
+
+def _analyze_color_mood(palette: list) -> str:
+    """색상 팔레트의 전체적인 무드 분석"""
+    if not palette:
+        return "neutral"
+
+    total_r, total_g, total_b = 0, 0, 0
+    total_saturation = 0
+    total_brightness = 0
+
+    for r, g, b in palette:
+        total_r += r
+        total_g += g
+        total_b += b
+
+        # HSV 계산을 위한 변환
+        max_c = max(r, g, b)
+        min_c = min(r, g, b)
+        brightness = max_c / 255
+        saturation = (max_c - min_c) / max_c if max_c > 0 else 0
+
+        total_saturation += saturation
+        total_brightness += brightness
+
+    n = len(palette)
+    avg_r, avg_g, avg_b = total_r / n, total_g / n, total_b / n
+    avg_saturation = total_saturation / n
+    avg_brightness = total_brightness / n
+
+    # 무드 결정 로직
+    if avg_saturation > 0.6 and avg_brightness > 0.5:
+        return "vibrant"
+    elif avg_saturation < 0.3:
+        return "muted"
+    elif avg_r > avg_b and avg_r > avg_g * 0.9:
+        return "warm"
+    elif avg_b > avg_r and avg_b > avg_g * 0.9:
+        return "cool"
+    else:
+        return "neutral"
+
+
+def _generate_palette_name(palette: list) -> str:
+    """색상 팔레트의 특성에 기반한 이름 생성"""
+    if not palette:
+        return "Unknown"
+
+    # 주요 색상(첫 번째)의 특성 분석
+    r, g, b = palette[0]
+
+    # 밝기 계산
+    brightness = (r + g + b) / 3 / 255
+
+    # 채도 계산
+    max_c = max(r, g, b)
+    min_c = min(r, g, b)
+    saturation = (max_c - min_c) / max_c if max_c > 0 else 0
+
+    # 색조 결정
+    if max_c == min_c:
+        hue_name = "Gray"
+    elif r >= g and r >= b:
+        if g > b:
+            hue_name = "Orange" if saturation > 0.5 else "Tan"
+        else:
+            hue_name = "Red" if saturation > 0.5 else "Pink"
+    elif g >= r and g >= b:
+        if r > b:
+            hue_name = "Yellow-Green"
+        else:
+            hue_name = "Green" if saturation > 0.5 else "Sage"
+    else:  # b is max
+        if r > g:
+            hue_name = "Purple" if saturation > 0.5 else "Lavender"
+        else:
+            hue_name = "Blue" if saturation > 0.5 else "Sky"
+
+    # 밝기 수식어
+    if brightness > 0.7:
+        brightness_adj = "Light"
+    elif brightness < 0.3:
+        brightness_adj = "Dark"
+    else:
+        brightness_adj = ""
+
+    # 팔레트 이름 조합
+    if brightness_adj:
+        return f"{brightness_adj} {hue_name} Tones"
+    else:
+        return f"{hue_name} Tones"
+
+
+# ============================================
 # 분석 함수
 # ============================================
 
-def analyze_with_gemini(image: Image.Image, model_id: str, resolution: str) -> dict:
-    """Gemini API로 이미지 분석"""
+def _call_gemini_api(image: Image.Image, model_id: str, resolution: str) -> dict:
+    """Gemini API만 호출하는 내부 함수"""
     model_config = MODEL_OPTIONS[model_id]
-
-    # 해상도 설정
-    resolution_map = {
-        "low": "media_resolution_low",
-        "medium": "media_resolution_medium",
-        "high": "media_resolution_high",
-    }
 
     try:
         model = genai.GenerativeModel(model_id)
@@ -838,6 +1086,33 @@ def analyze_with_gemini(image: Image.Image, model_id: str, resolution: str) -> d
         }
 
 
+def analyze_with_gemini(image: Image.Image, model_id: str, resolution: str) -> dict:
+    """
+    Gemini API와 색상 추출을 병렬로 실행하여 이미지 분석
+
+    - LLM API: 카테고리, 스타일, 무드, 패턴, 키워드 등 분석
+    - ColorThief: 색상 추출 (일관된 결과 보장)
+    """
+    # 병렬 실행: LLM API 호출 + 색상 추출
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        # LLM API 호출 (비동기)
+        llm_future = executor.submit(_call_gemini_api, image, model_id, resolution)
+
+        # 색상 추출 (비동기)
+        color_future = executor.submit(extract_colors_from_image, image, 5)
+
+        # 결과 수집
+        llm_result = llm_future.result()
+        color_result = color_future.result()
+
+    # LLM 결과에 색상 추출 결과 병합
+    if llm_result["success"]:
+        # LLM이 추출한 색상 대신 ColorThief 결과로 대체
+        llm_result["metadata"]["colors"] = color_result
+
+    return llm_result
+
+
 def analyze_image(image: Image.Image, model_id: str, resolution: str = "medium") -> dict:
     """이미지 분석 (Gemini API 사용)"""
     return analyze_with_gemini(image, model_id, resolution)
@@ -855,9 +1130,9 @@ def show_detail_inline(result: dict):
 
     with col1:
         # 이미지 표시
-        if result.get("image_data"):
+        if result.get("image_url"):
             st.image(
-                f"data:image/png;base64,{result['image_data']}",
+                result['image_url'],
                 caption=result['filename'],
                 use_container_width=True
             )
@@ -920,7 +1195,6 @@ def show_detail_inline(result: dict):
         pattern = metadata.get("pattern", {})
         if pattern:
             st.markdown(f"**패턴:** {pattern.get('scale', 'N/A')} / {pattern.get('repeat_type', 'N/A')} / {pattern.get('density', 'N/A')}")
-
         # 키워드
         keywords = metadata.get("keywords", {})
         if keywords.get("search_tags"):
@@ -955,9 +1229,9 @@ def show_detail_dialog(result: dict):
 
     with col1:
         # 이미지 표시
-        if result.get("image_data"):
+        if result.get("image_url"):
             st.image(
-                f"data:image/png;base64,{result['image_data']}",
+                result['image_url'],
                 caption=result['filename'],
                 use_container_width=True
             )
@@ -1256,7 +1530,10 @@ def main():
                         st.session_state.results.append(result_data)
 
                         # DB에 저장
-                        save_result_to_db(result_data)
+                        try:
+                            save_result_to_db(result_data)
+                        except Exception as db_err:
+                            st.warning(f"⚠️ DB 저장 실패: {db_err}")
 
                         progress_bar.progress((idx + 1) / len(uploaded_files))
 
@@ -1302,13 +1579,16 @@ def main():
                                 comparison["results"][model_id] = result
 
                                 # DB에 저장
-                                save_result_to_db({
-                                    "filename": file.name,
-                                    "model": model_id,
-                                    "resolution": resolution,
-                                    "result": result,
-                                    "image": image
-                                })
+                                try:
+                                    save_result_to_db({
+                                        "filename": file.name,
+                                        "model": model_id,
+                                        "resolution": resolution,
+                                        "result": result,
+                                        "image": image
+                                    })
+                                except Exception as db_err:
+                                    st.warning(f"⚠️ DB 저장 실패 ({model_id}): {db_err}")
 
                                 with cols[idx]:
                                     model_name = MODEL_OPTIONS[model_id]["name"].split(". ")[1]
@@ -1514,7 +1794,7 @@ def main():
                             with st.expander(f"📄 {comp['filename']} ({comp['variant_count']}개 시행)", expanded=(comp_idx == 0)):
                                 if comp["thumbnail"]:
                                     st.image(
-                                        f"data:image/png;base64,{comp['thumbnail']}",
+                                        comp['thumbnail'],  # S3 URL
                                         caption=comp["filename"],
                                         width=200
                                     )
@@ -1956,9 +2236,9 @@ def main():
                                     thumb_col, info_col = st.columns([1, 3])
 
                                     with thumb_col:
-                                        if r.get("image_data"):
+                                        if r.get("image_url"):
                                             st.image(
-                                                f"data:image/png;base64,{r['image_data']}",
+                                                r['image_url'],
                                                 caption=r["filename"],
                                                 use_container_width=True
                                             )
