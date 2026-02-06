@@ -28,6 +28,8 @@ cp .env.example .env
 
 **API 키 발급**: [Google AI Studio](https://aistudio.google.com/) → Get API Key
 
+!!!\*\* **[ 4월12일 ]** 이후에는 무료 크레딧 만료되어 비용 청구됨
+
 ### 3. 실행
 
 ```bash
