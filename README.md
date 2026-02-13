@@ -42,6 +42,7 @@ streamlit run app.py
 
 - **이미지 업로드**: 여러 이미지 동시 업로드 지원
 - **메타데이터 추출**:
+  - 디자인 제목 자동 생성
   - 카테고리 분류 (floral, geometric, ethnic 등)
   - 색상 분석 (Hex 코드, 팔레트 이름)
   - 스타일/무드 분석
@@ -59,6 +60,7 @@ streamlit run app.py
 
 ```json
 {
+  "title": "Midnight Garden",
   "category": {
     "primary": "floral",
     "secondary": ["botanical", "nature"],
@@ -132,7 +134,6 @@ image-metadata-mvp/
 │   ├── env.py
 │   └── versions/       # 마이그레이션 스크립트
 ├── requirements.txt    # Python 패키지
-├── .env.example        # 환경변수 템플릿
 └── README.md           # 이 파일
 ```
 

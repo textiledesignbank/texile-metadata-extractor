@@ -209,8 +209,9 @@ def upload_image_to_s3(image: Image.Image, filename: str, image_hash: str) -> st
                 'CacheControl': 'max-age=31536000'  # 1년 캐시
             }
         )
-        # S3 URL 생성
-        image_url = f"https://{bucket_name}.s3.{get_api_key('AWS_REGION') or 'ap-northeast-2'}.amazonaws.com/{s3_key}"
+        # CloudFront URL 생성 (S3 직접 접근은 403 → CloudFront 경유 필요)
+        cdn_domain = get_api_key("CDN_DOMAIN") or f"{bucket_name}.textiledesignbank.com"
+        image_url = f"https://{cdn_domain}/{s3_key}"
         return image_url
 
     except ClientError as e:
@@ -629,6 +630,8 @@ def get_same_image_comparison():
                     "resolution": r.resolution,
                     "cost_usd": float(r.cost_usd) if r.cost_usd else 0,
                     "elapsed_time": float(r.elapsed_time) if r.elapsed_time else 0,
+                    # 제목
+                    "title": meta.get("title", ""),
                     # 카테고리
                     "categories": cat_data.get("matches", []),
                     "confidence": cat_data.get("confidence"),
@@ -801,6 +804,7 @@ CATEGORY_OPTIONS = [
 ANALYSIS_PROMPT = f"""Analyze this textile/pattern design image and provide metadata in the following JSON structure:
 
 {{
+  "title": "A creative, evocative design title (2-4 words in English, like a professional textile designer would name it. Examples: 'Midnight Garden', 'Coral Bloom', 'Azure Wave', 'Wild Meadow', 'Ember Glow'. Capture the mood, color, and essence of the design poetically.)",
   "category": {{
     "matches": ["top 3 categories in order of relevance - first is most relevant (MUST be from: {', '.join(CATEGORY_OPTIONS)})"],
     "confidence": 0.0-1.0
@@ -809,7 +813,7 @@ ANALYSIS_PROMPT = f"""Analyze this textile/pattern design image and provide meta
     "dominant": ["#hex1", "#hex2", "#hex3"],
     "palette_name": "descriptive name",
     "mood": "warm/cool/neutral/vibrant/muted"
-  }},ㄴ
+  }},
   "style": {{
     "type": "style name",
     "era": "time period if applicable",
@@ -1150,6 +1154,11 @@ def show_detail_inline(result: dict):
     with col2:
         metadata = result["metadata"]
 
+        # 제목
+        title = metadata.get("title")
+        if title:
+            st.markdown(f"## ✨ {title}")
+
         # 카테고리
         category = metadata.get("category", {})
         matches = category.get("matches", [])
@@ -1250,6 +1259,11 @@ def show_detail_dialog(result: dict):
 
     with col2:
         metadata = result["metadata"]
+
+        # 제목
+        title = metadata.get("title")
+        if title:
+            st.markdown(f"## ✨ {title}")
 
         # 카테고리
         category = metadata.get("category", {})
@@ -1561,11 +1575,12 @@ def main():
                             with st.spinner(f"🚀 {len(selected_models)}개 모델 병렬 분석 중..."):
                                 results_map = {}
 
-                                def analyze_model(model_id):
-                                    return model_id, analyze_image(image, model_id, resolution)
+                                # PIL Image는 thread-safe하지 않으므로 각 모델별 복사본 생성
+                                def analyze_model(model_id, img_copy):
+                                    return model_id, analyze_image(img_copy, model_id, resolution)
 
                                 with ThreadPoolExecutor(max_workers=len(selected_models)) as executor:
-                                    futures = {executor.submit(analyze_model, m): m for m in selected_models}
+                                    futures = {executor.submit(analyze_model, m, image.copy()): m for m in selected_models}
                                     for future in as_completed(futures):
                                         model_id, result = future.result()
                                         results_map[model_id] = result
@@ -1598,6 +1613,9 @@ def main():
                                         st.success(f"✅ {result['elapsed_time']:.2f}s | ₩{result['cost']['krw']:.2f}")
 
                                         metadata = result["metadata"]
+                                        title = metadata.get("title")
+                                        if title:
+                                            st.markdown(f"**✨ {title}**")
                                         cat_matches = metadata.get('category', {}).get('matches', [])
                                         cat_display = ', '.join(cat_matches) if cat_matches else metadata.get('category', {}).get('primary', 'N/A')
                                         st.markdown(f"**카테고리:** {cat_display}")
@@ -1649,6 +1667,9 @@ def main():
                     if item["result"]["success"]:
                         metadata = item["result"]["metadata"]
 
+                        title = metadata.get("title")
+                        if title:
+                            st.markdown(f"**✨ {title}**")
                         cat_matches = metadata.get('category', {}).get('matches', [])
                         cat_display = ', '.join(cat_matches) if cat_matches else metadata.get('category', {}).get('primary', 'N/A')
                         st.markdown(f"**카테고리:** {cat_display}")
@@ -1689,6 +1710,7 @@ def main():
                         cat_matches = m.get("category", {}).get("matches", [])
                         rows.append({
                             "filename": item["filename"],
+                            "title": m.get("title", ""),
                             "model": item["model"],
                             "resolution": item["resolution"],
                             "category": ", ".join(cat_matches) if cat_matches else m.get("category", {}).get("primary", ""),
@@ -1812,6 +1834,7 @@ def main():
                                     comparison_rows.append({
                                         "모델": short_name,
                                         "해상도": r["resolution"],
+                                        "제목": r.get("title", "") or "-",
                                         "카테고리": ", ".join(r["categories"][:3]) if r["categories"] else "-",
                                         "신뢰도": f"{r['confidence']:.0%}" if r["confidence"] else "-",
                                         "스타일": r["style_type"] or "-",
@@ -2063,6 +2086,7 @@ def main():
                             }
                             if r["success"] and r["metadata"]:
                                 m = r["metadata"]
+                                row["제목"] = m.get("title", "")
                                 cat_matches = m.get("category", {}).get("matches", [])
                                 row["카테고리"] = ", ".join(cat_matches) if cat_matches else m.get("category", {}).get("primary", "")
                                 row["신뢰도"] = m.get("category", {}).get("confidence", "")
@@ -2218,7 +2242,9 @@ def main():
                         confidence = meta.get("category", {}).get("confidence")
 
                         # 헤더 구성
-                        header = f"{status_icon} **{r['filename']}** | {model_name} | {r['resolution']} | {category_str}"
+                        title_str = meta.get("title", "")
+                        title_part = f" | ✨ {title_str}" if title_str else ""
+                        header = f"{status_icon} **{r['filename']}**{title_part} | {model_name} | {r['resolution']} | {category_str}"
 
                         col_check, col_expander = st.columns([0.5, 9.5])
 
@@ -2246,6 +2272,9 @@ def main():
                                             st.info("이미지 없음")
 
                                     with info_col:
+                                        title_val = meta.get("title")
+                                        if title_val:
+                                            st.markdown(f"### ✨ {title_val}")
                                         info_col1, info_col2, info_col3 = st.columns(3)
                                         with info_col1:
                                             st.metric("비용", f"₩{r['cost_krw']:.2f}" if r["cost_krw"] else "-")
